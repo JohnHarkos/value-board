@@ -1,0 +1,7 @@
+.env
+node_modules/
+data/
+*.bak-*
+*.avant-*
+*.log
+backups/
