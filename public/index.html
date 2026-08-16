@@ -281,6 +281,10 @@ nav{background:rgba(12,18,24,.92) !important;backdrop-filter:blur(14px) !importa
 .pastilleConf{display:inline-block;width:9px;height:9px;border-radius:50%;
   margin-left:7px;vertical-align:middle;background:#4ADE80;
   box-shadow:0 0 6px rgba(74,222,128,.7)}
+
+.pastilleOr{display:inline-block;width:9px;height:9px;border-radius:50%;
+  margin-left:7px;vertical-align:middle;background:#F59E0B;
+  box-shadow:0 0 6px rgba(245,158,11,.6)}
 </style>
 </head>
 <body>
@@ -657,13 +661,20 @@ const MAX_DIVERGENCE = 20;
 // l accord entre le modele et le bookmaker sur les cotes moyennes est le
 // seul segment ou le rendement historique depasse le temoin. Ce n est PAS
 // une garantie de gain, seulement un repere de coherence.
-function signalCoherent(p){
-  const implicite = 1 / p.o;
-  const ecart = Math.abs(p.pA - implicite) * 100;
-  const cotesOk = p.o >= 1.50 && p.o <= 1.75;
-  const lecturesOk = xgIndispo ? true : (Math.abs(p.vA - p.vB) < 15);
-  return cotesOk && ecart < 3 && lecturesOk && !p.suspect;
+// Deux niveaux, mesures sur 6 saisons et 16 championnats :
+//   vert   cote 1.50-1.75, ecart < 3 pts  -> ROI historique +4.9% (498 paris)
+//   orange cote 1.45-1.85, ecart < 5 pts  -> ROI historique +1.7% (1423 paris)
+//   temoin (tous les paris de la tranche) -> ROI historique -2.4%
+// Marges d erreur larges (+/-7 et +/-4) : c est un repere de coherence,
+// pas une promesse de gain.
+function niveauCoherence(p){
+  if (p.suspect) return null;
+  const ecart = Math.abs(p.pA - 1/p.o) * 100;
+  if (p.o >= 1.50 && p.o <= 1.75 && ecart < 3) return 'vert';
+  if (p.o >= 1.45 && p.o <= 1.85 && ecart < 5) return 'orange';
+  return null;
 }
+function signalCoherent(p){ return niveauCoherence(p) === 'vert'; }
 function confirmeMode(p, E){
   if (p.suspect) return false;
   // Pas de vrais xG : une seule lecture existe, la double validation et le
@@ -1449,7 +1460,7 @@ function renderValues(picks,E,sane){
       ? (p.pA*100).toFixed(0)+'%'
       : lo+'\u2013'+hi+'%';
     return '<div class="vrow">'+
-      `<div class="vtop"><span class="vname">${p.label}${tag}${signalCoherent(p)?'<span class="pastilleConf" title="Signal coherent : modele et bookmaker d accord, cote dans la tranche la plus fiable"></span>':''}</span><span class="vodd">cote ${fmt(p.o)}</span></div>`+
+      `<div class="vtop"><span class="vname">${p.label}${tag}${(function(){const n=niveauCoherence(p);return n==='vert'?'<span class="pastilleConf" title="Coherence forte : modele et book d accord a moins de 3 points, cote 1.50-1.75. ROI historique +4.9% sur 498 paris."></span>':n==='orange'?'<span class="pastilleOr" title="Coherence moyenne : accord a moins de 5 points, cote 1.45-1.85. ROI historique +1.7% sur 1423 paris."></span>':'';})()}</span><span class="vodd">cote ${fmt(p.o)}</span></div>`+
       `<div class="vmeta">modèle ${modeleTxt} · bookmaker ${implied}% · `+
       `<b class="${cl(p.vA)}">${p.vA>=0?'+':''}${p.vA.toFixed(1)}%</b>`+
       (epureSport()
@@ -1689,7 +1700,7 @@ function scanHeure(iso){
   try{ return new Date(iso).toLocaleString('fr-FR',{weekday:'short',day:'2-digit',
     month:'2-digit',hour:'2-digit',minute:'2-digit'}); }catch(e){ return iso; }
 }
-async function scanRemplir(m){
+async async function scanRemplir(m){
   const set2=(id,v)=>{const el=$(id); if(el&&v!=null&&v!==''){el.value=v;
     el.dispatchEvent(new Event('input',{bubbles:true}));}};
   const g=k=>m.mien[k]?m.mien[k].price:null;
@@ -1724,57 +1735,32 @@ async function scanRemplir(m){
   const el=$('o_1'); if(el&&el.scrollIntoView) el.scrollIntoView({behavior:'smooth',block:'center'});
 }
 
-// Sections repliables : fermees par defaut pour degager l'ecran, mais
-// ouvertes automatiquement si une source a echoue -- sinon on lirait un
-// verdict calcule sur des valeurs par defaut sans jamais le voir.
-function initRepli(){
-  document.querySelectorAll('section.repliable > .eyebrow').forEach(t=>{
-    if(t.dataset.repli) return;
-    t.dataset.repli='1';
-    t.addEventListener('click',()=>t.parentElement.classList.toggle('ouvert'));
-  });
+// Rapprochement des noms d equipes entre Odds API et API-Football.
+// Strict volontairement : pas de correspondance sur les premieres lettres
+// (Manchester United / Manchester City partagent les 10 premieres), et
+// refus si plusieurs options correspondent.
+function scanNorm(x){
+  return String(x||'').toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .replace(/\b(fc|cf|sc|ac|cd|ud|rc|club|de|la|el|real|deportivo)\b/g,' ')
+    .replace(/[^a-z0-9]+/g,' ').trim();
 }
-function ouvrirRepli(id){
-  const el=document.getElementById(id);
-  if(el) el.classList.add('ouvert');
-}
-document.addEventListener('DOMContentLoaded', initRepli);
-
-
-// Vide les cotes des qu une equipe change : sinon on melange les cotes
-// d un match avec les stats d un autre, et le verdict devient coherent
-// en apparence mais faux en realite. Constate en usage reel.
-let dernierMatchVu = '';
-function videCotesSiMatchChange(){
-  const h = $('tH') ? $('tH').value : '';
-  const a = $('tA') ? $('tA').value : '';
-  const cle = h + '|' + a;
-  if (cle === dernierMatchVu) return;
-  if (dernierMatchVu !== '' && (h || a)) {
-    if (typeof ODD_IDS !== 'undefined') {
-      ODD_IDS.forEach(o=>{
-        if($(o)) $(o).value='';
-        if(typeof updateImplied==='function') updateImplied(o.slice(2));
-        const sp=$('spread_'+o.slice(2)); if(sp){sp.style.display='none';sp.textContent='';}
-        const bk=$('book_'+o.slice(2)); if(bk){bk.style.display='none';bk.textContent='';}
-      });
-    }
-    const d=$('oddsDrift'); if(d){d.style.display='none';d.innerHTML='';}
-    ['detailWrap','saveWrap','valuesWrap','pronoWrap'].forEach(id=>{
-      if($(id)) $(id).style.display='none';
+function scanChoisirOption(sel, nom){
+  if(!sel) return false;
+  const cible=scanNorm(nom);
+  const opts=[...sel.options].filter(o=>o.value);
+  let hit=opts.filter(o=>scanNorm(o.value)===cible);
+  if(hit.length!==1){
+    hit=opts.filter(o=>{
+      const v=scanNorm(o.value);
+      return v && cible && (v.includes(cible)||cible.includes(v));
     });
-    if(typeof toast==='function') toast('Cotes videes — nouveau match');
   }
-  dernierMatchVu = cle;
+  if(hit.length!==1) return false;
+  sel.value=hit[0].value;
+  sel.dispatchEvent(new Event('change',{bubbles:true}));
+  return true;
 }
-document.addEventListener('DOMContentLoaded',()=>{
-  ['tH','tA'].forEach(id=>{
-    const el=$(id);
-    if(el) el.addEventListener('change', videCotesSiMatchChange);
-  });
-  const h=$('tH'), a=$('tA');
-  dernierMatchVu = (h?h.value:'')+'|'+(a?a.value:'');
-});
 
 let scanCache=[];
 on('scanGo','click',async()=>{
