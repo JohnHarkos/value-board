@@ -667,6 +667,17 @@ const MAX_DIVERGENCE = 20;
 //   temoin (tous les paris de la tranche) -> ROI historique -2.4%
 // Marges d erreur larges (+/-7 et +/-4) : c est un repere de coherence,
 // pas une promesse de gain.
+
+// Fourchette jouable. Deux raisons, l une pratique, l autre mesuree :
+//   - ce sont les cotes reellement jouees (pas d outsider a 3.75) ;
+//   - le backtest sur 50 000 paris montre que le rendement se degrade
+//     fortement au-dela de 2.00 (-4.3% a 2.00-2.50, -20% au-dela de 5).
+// La value grimpe mecaniquement sur les cotes hautes : un petit ecart de
+// probabilite y produit un gros pourcentage. Trier par value seule remonte
+// donc systematiquement les paris les plus perdants.
+const COTE_MIN_JOUABLE = 1.40;
+const COTE_MAX_JOUABLE = 2.10;
+function coteJouable(p){ return p.o >= COTE_MIN_JOUABLE && p.o <= COTE_MAX_JOUABLE; }
 function niveauCoherence(p){
   if (p.suspect) return null;
   const ecart = Math.abs(p.pA - 1/p.o) * 100;
@@ -1154,7 +1165,14 @@ async function runAutoFetch(){
     // Ce n'est alors PAS une seconde lecture : comparer l'equipe reelle a une
     // equipe moyenne fabrique de fausses contradictions. On le signale pour
     // que le reste de l'app cesse de traiter ce chiffre comme une validation.
-    xgIndispo = (data.warnings||[]).some(w=>/non couvert par Understat/i.test(w));
+    // Understat ne couvre que 6 championnats. On ne se fie plus au message
+    // d erreur (qui varie selon la cause) mais directement au nom du
+    // championnat : ailleurs, le champ xG est un repli sur la moyenne, pas
+    // une seconde lecture.
+    const lgTxt = ($('lgName') ? $('lgName').value : '').toLowerCase();
+    const COUVERTS = /premier league|epl|angleterre|la liga|laliga|espagne|bundesliga|allemagne|serie a|italie|ligue 1|france|rfpl|russie/;
+    xgIndispo = !COUVERTS.test(lgTxt)
+      || (data.warnings||[]).some(w=>/non couvert par Understat/i.test(w));
     const oddsFailed=(data.warnings||[]).some(w=>w.startsWith('cotes'));
     if(statsFailed) ['a1','a2','a3','a4'].forEach(clearField);
     if(xgFailed) ['b1','b2','b3','b4'].forEach(clearField);
@@ -1400,7 +1418,11 @@ function analyse(scroll){
     return;
   }
 
-  picks.sort((a,b)=>b.worst-a.worst);
+  picks.sort((a,b)=>{
+    const ja=coteJouable(a)?1:0, jb=coteJouable(b)?1:0;
+    if(ja!==jb) return jb-ja;
+    return b.worst-a.worst;
+  });
   lastPicks=picks;
   render(picks,sane);
   if($('detailWrap'))$('detailWrap').style.display='block';
@@ -1431,8 +1453,8 @@ function renderValues(picks,E,sane){
     return;
   }
 
-  const playable=picks.filter(p=>confirmeMode(p,E));
-  const rest=picks.filter(p=>!confirmeMode(p,E));
+  const playable=picks.filter(p=>coteJouable(p) && confirmeMode(p,E));
+  const rest=picks.filter(p=>!(coteJouable(p) && confirmeMode(p,E)));
   const ordered=playable.concat(rest);
 
   if(empty) empty.style.display=playable.length?'none':'block';
@@ -1499,7 +1521,7 @@ function renderProno(picks,E,sane){
   // value mais grosse cote uniquement visible dans "Values de ce match"
   // plus bas (jamais caché, juste pas recommandé en tête).
   const MAX_ODDS_PRONO=2.00;
-  const confirmed=p=>confirmeMode(p,E)||(analysisMode!=='sport'&&p.vA>=E&&p.vB>=E);
+  const confirmed=p=>coteJouable(p) && (confirmeMode(p,E)||(analysisMode!=='sport'&&p.vA>=E&&p.vB>=E));
   const candidates=picks.filter(p=>!p.suspect&&confirmed(p)&&p.o<=MAX_ODDS_PRONO);
   if(!candidates.length||!sane){ wrap.style.display='none'; return; }
   wrap.style.display='block';
@@ -1564,7 +1586,15 @@ function render(picks,sane){
   }).join('');
 
   const v=$('verdict'); if(!v)return;
-  const best = donneesInsuffisantes ? null : picks.find(p=>confirmeMode(p,E));
+  // Mon prono suit desormais les pastilles, pas la value : le backtest
+  // montre que la value ne predit rien, alors que la coherence
+  // modele/bookmaker sur les cotes moyennes est le seul segment qui bat
+  // le temoin. Vert d abord, orange ensuite, rien sinon.
+  const best = donneesInsuffisantes ? null : (
+    picks.find(p=>niveauCoherence(p)==='vert')
+    || picks.find(p=>niveauCoherence(p)==='orange')
+    || null
+  );
   if (donneesInsuffisantes && v) {
     v.className='verdict err';
     v.innerHTML='<div class="lead">Verdict</div>'
@@ -1700,7 +1730,7 @@ function scanHeure(iso){
   try{ return new Date(iso).toLocaleString('fr-FR',{weekday:'short',day:'2-digit',
     month:'2-digit',hour:'2-digit',minute:'2-digit'}); }catch(e){ return iso; }
 }
-async async function scanRemplir(m){
+async function scanRemplir(m){
   const set2=(id,v)=>{const el=$(id); if(el&&v!=null&&v!==''){el.value=v;
     el.dispatchEvent(new Event('input',{bubbles:true}));}};
   const g=k=>m.mien[k]?m.mien[k].price:null;
@@ -1732,6 +1762,15 @@ async async function scanRemplir(m){
   else if(!$('tH')||$('tH').disabled) toast('Cotes chargees — choisis d abord le championnat');
   else toast('Cotes chargees — selectionne les equipes a la main');
 
+  // Le scanner ne recupere que les cotes. Sans les statistiques du match,
+  // le modele calcule sur les donnees du match precedent et affiche des
+  // pourcentages qui ne decrivent pas ce match. On enchaine donc la vraie
+  // recherche -- mais seulement si les equipes ont ete reconnues, sinon
+  // elle partirait sur le mauvais match.
+  if (okH && okA) {
+    const btn = $('autoFetch');
+    if (btn) { toast('Recherche des statistiques...'); btn.click(); }
+  }
   const el=$('o_1'); if(el&&el.scrollIntoView) el.scrollIntoView({behavior:'smooth',block:'center'});
 }
 
@@ -1761,6 +1800,23 @@ function scanChoisirOption(sel, nom){
   sel.dispatchEvent(new Event('change',{bubbles:true}));
   return true;
 }
+
+
+// Sections repliables : rend les titres cliquables. Ouvre aussi le bloc
+// automatiquement quand une source a echoue, sinon on lirait un verdict
+// calcule sur des champs vides sans le voir.
+function initRepli(){
+  document.querySelectorAll('section.repliable > .eyebrow').forEach(t=>{
+    if(t.dataset.repli) return;
+    t.dataset.repli='1';
+    t.addEventListener('click',()=>t.parentElement.classList.toggle('ouvert'));
+  });
+}
+function ouvrirRepli(id){
+  const el=document.getElementById(id);
+  if(el) el.classList.add('ouvert');
+}
+document.addEventListener('DOMContentLoaded', initRepli);
 
 let scanCache=[];
 on('scanGo','click',async()=>{
