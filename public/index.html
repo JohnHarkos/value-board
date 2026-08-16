@@ -644,10 +644,13 @@ let analysisMode='double';
 // les listes. Il reste calcule, et une alerte apparait si l'ecart entre
 // les deux lectures depasse 20 points.
 const epureSport = () => analysisMode==='sport';
+const MAX_DIVERGENCE = 20;
 function confirmeMode(p, E){
-  return analysisMode==='sport'
-    ? (p.vA>=E && !p.suspect)
-    : (p.vA>=E && p.vB>=E && !p.suspect);
+  if (p.suspect) return false;
+  if (analysisMode !== 'sport') return p.vA>=E && p.vB>=E;
+  if (p.vA < E) return false;
+  if (Math.abs(p.vA - p.vB) >= MAX_DIVERGENCE && p.vB < 0) return false;
+  return true;
 }
 function applyMode(){
   const sport = analysisMode==='sport';
@@ -1411,12 +1414,18 @@ function renderValues(picks,E,sane){
             :'<span class="tag no">non</span>';
     const lo=(Math.min(p.pA,p.pB)*100).toFixed(0), hi=(Math.max(p.pA,p.pB)*100).toFixed(0);
     const implied=(100/p.o).toFixed(0);
+    // En mode sport, seule la lecture buts reels decide : afficher une
+    // fourchette laisserait croire que les deux comptent. On montre donc
+    // un seul chiffre, et on explicite le xG uniquement s il contredit.
+    const modeleTxt = epureSport()
+      ? (p.pA*100).toFixed(0)+'%'
+      : lo+'\u2013'+hi+'%';
     return '<div class="vrow">'+
       `<div class="vtop"><span class="vname">${p.label}${tag}</span><span class="vodd">cote ${fmt(p.o)}</span></div>`+
-      `<div class="vmeta">modèle ${lo}–${hi}% · bookmaker ${implied}% · `+
+      `<div class="vmeta">modèle ${modeleTxt} · bookmaker ${implied}% · `+
       `<b class="${cl(p.vA)}">${p.vA>=0?'+':''}${p.vA.toFixed(1)}%</b>`+
       (epureSport()
-        ? (Math.abs(p.vA-p.vB)>=20 ? ` <b style="color:var(--rose)">&#9888;</b>` : '')
+        ? (Math.abs(p.vA-p.vB)>=20 ? ` <b style="color:var(--rose)">&#9888; xG : ${(p.pB*100).toFixed(0)}%</b>` : '')
         : ` / <b class="${cl(p.vB)}">${p.vB>=0?'+':''}${p.vB.toFixed(1)}%</b>`)+
       `</div>`+
       (p.suspect?'<div class="hint" style="margin-top:2px">Value irréaliste sur un marché réel — probablement une cote isolée/périmée chez un bookmaker plutôt qu\'une vraie opportunité. Vérifie le consensus avant de parier dessus.</div>':'')+
@@ -1579,7 +1588,7 @@ function render(picks,sane){
       }
     }
     v.innerHTML='<div class="lead">Verdict</div><div class="big">'+best.label+'</div>'+
-      `<div class="sub">${sportIntro}${best.vA>=0?'+':''}${best.vA.toFixed(1)} %${sportTail}. Cote ${fmt(best.o)}, probabilité modèle entre ${(Math.min(best.pA,best.pB)*100).toFixed(0)} et ${(Math.max(best.pA,best.pB)*100).toFixed(0)} % — contre ${(100/best.o).toFixed(0)} % implicite du bookmaker.${lowSample?' <b style="color:var(--sky)">Échantillon faible</b> — moins de 8 matchs joués d\'un côté, le modèle s\'appuie surtout sur la moyenne du championnat plutôt que sur cette équipe.':''}${anySuspect?' <b style="color:var(--rose)">Un autre marché de ce match a été écarté</b> (cote isolée, value irréaliste) — sans lien avec ce pari.':''}</div>`+
+      `<div class="sub">${sportIntro}${best.vA>=0?'+':''}${best.vA.toFixed(1)} %${sportTail}. Cote ${fmt(best.o)}, probabilité modèle ${analysisMode==='sport' ? (best.pA*100).toFixed(0)+' %' : 'entre '+(Math.min(best.pA,best.pB)*100).toFixed(0)+' et '+(Math.max(best.pA,best.pB)*100).toFixed(0)+' %'} — contre ${(100/best.o).toFixed(0)} % implicite du bookmaker.${lowSample?' <b style="color:var(--sky)">Échantillon faible</b> — moins de 8 matchs joués d\'un côté, le modèle s\'appuie surtout sur la moyenne du championnat plutôt que sur cette équipe.':''}${anySuspect?' <b style="color:var(--rose)">Un autre marché de ce match a été écarté</b> (cote isolée, value irréaliste) — sans lien avec ce pari.':''}</div>`+
       `<div class="stake">Mise fixe : ${cfg.stake.toFixed(2)} €${best.o<1.5?' · cote basse, marge élevée':''}</div>`+
       kellyLine;
   } else {
@@ -1702,6 +1711,42 @@ function ouvrirRepli(id){
   if(el) el.classList.add('ouvert');
 }
 document.addEventListener('DOMContentLoaded', initRepli);
+
+
+// Vide les cotes des qu une equipe change : sinon on melange les cotes
+// d un match avec les stats d un autre, et le verdict devient coherent
+// en apparence mais faux en realite. Constate en usage reel.
+let dernierMatchVu = '';
+function videCotesSiMatchChange(){
+  const h = $('tH') ? $('tH').value : '';
+  const a = $('tA') ? $('tA').value : '';
+  const cle = h + '|' + a;
+  if (cle === dernierMatchVu) return;
+  if (dernierMatchVu !== '' && (h || a)) {
+    if (typeof ODD_IDS !== 'undefined') {
+      ODD_IDS.forEach(o=>{
+        if($(o)) $(o).value='';
+        if(typeof updateImplied==='function') updateImplied(o.slice(2));
+        const sp=$('spread_'+o.slice(2)); if(sp){sp.style.display='none';sp.textContent='';}
+        const bk=$('book_'+o.slice(2)); if(bk){bk.style.display='none';bk.textContent='';}
+      });
+    }
+    const d=$('oddsDrift'); if(d){d.style.display='none';d.innerHTML='';}
+    ['detailWrap','saveWrap','valuesWrap','pronoWrap'].forEach(id=>{
+      if($(id)) $(id).style.display='none';
+    });
+    if(typeof toast==='function') toast('Cotes videes — nouveau match');
+  }
+  dernierMatchVu = cle;
+}
+document.addEventListener('DOMContentLoaded',()=>{
+  ['tH','tA'].forEach(id=>{
+    const el=$(id);
+    if(el) el.addEventListener('change', videCotesSiMatchChange);
+  });
+  const h=$('tH'), a=$('tA');
+  dernierMatchVu = (h?h.value:'')+'|'+(a?a.value:'');
+});
 
 let scanCache=[];
 on('scanGo','click',async()=>{
