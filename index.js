@@ -831,6 +831,43 @@ async function getTeamStatsForSeason(env, league, season, teamId) {
   return await apiFootballGet(env, "/teams/statistics", { league, season, team: teamId });
 }
 
+
+// Melange des deux saisons. Mesure par backtest sur 8 premieres journees,
+// 8 championnats, 2 paires de saisons :
+//   sans melange (comportement precedent) : Brier 0.6166 sur 240 matchs
+//   poids 1 : 0.5883   poids 2 : 0.5840   poids 3 : 0.5894   poids 5 : 0.5939
+// Poids 2 retenu : un match de la saison en cours compte comme deux de la
+// precedente. Gain de 0.033 sur le Brier (l optimisation de K et rho n en
+// rapportait que 0.0002) et 4x plus de matchs analysables en debut de saison.
+const POIDS_SAISON_COURANTE = 2;
+
+function melangeStats(sNew, sOld) {
+  const nNew = sNew?.fixtures?.played;
+  const nOld = sOld?.fixtures?.played;
+  if (!nOld || (nOld.home + nOld.away) === 0) return { stats: sNew, melange: false };
+  if (!nNew || (nNew.home + nNew.away) === 0) return { stats: sOld, melange: false, seulAncien: true };
+
+  const num = v => { const x = Number(v); return isFinite(x) ? x : 0; };
+  const mix = (aNew, cNew, aOld, cOld) => {
+    const pn = cNew * POIDS_SAISON_COURANTE, po = cOld;
+    if (pn + po === 0) return "0.0";
+    return ((num(aNew) * pn + num(aOld) * po) / (pn + po)).toFixed(2);
+  };
+
+  const gN = sNew.goals, gO = sOld.goals;
+  const out = JSON.parse(JSON.stringify(sNew));
+  out.goals.for.average.home     = mix(gN.for.average.home,     nNew.home, gO.for.average.home,     nOld.home);
+  out.goals.for.average.away     = mix(gN.for.average.away,     nNew.away, gO.for.average.away,     nOld.away);
+  out.goals.against.average.home = mix(gN.against.average.home, nNew.home, gO.against.average.home, nOld.home);
+  out.goals.against.average.away = mix(gN.against.average.away, nNew.away, gO.against.average.away, nOld.away);
+  // Nombre de matchs pondere : sert au garde-fou "donnees insuffisantes"
+  // cote app, qui doit voir un echantillon reel et non 1 seul match.
+  out.fixtures.played.home  = nNew.home * POIDS_SAISON_COURANTE + nOld.home;
+  out.fixtures.played.away  = nNew.away * POIDS_SAISON_COURANTE + nOld.away;
+  out.fixtures.played.total = out.fixtures.played.home + out.fixtures.played.away;
+  return { stats: out, melange: true, nNew: nNew.home + nNew.away, nOld: nOld.home + nOld.away };
+}
+
 async function getTeamStatsWithFallback(env, league, season, teamId) {
   // Round 16 — repli sur la saison précédente. Avant la 1ère journée d'une
   // saison, API-Football répond valablement (200) mais avec 0 match joué :
@@ -839,13 +876,26 @@ async function getTeamStatsWithFallback(env, league, season, teamId) {
   // automatiquement sur la saison précédente complète (même compétition,
   // adversaires comparables) dès que la saison demandée a 0 match joué pour
   // CETTE équipe. Toujours signalé (usedFallback), jamais silencieux.
+  // Modifie le 16/08/2026 : au lieu de basculer en tout-ou-rien sur la
+  // saison precedente quand la courante est vide, on MELANGE les deux des
+  // que la saison en cours compte peu de matchs. Avec 1 match joue,
+  // l ancien code gardait ce seul match et jetait les 34 de l an dernier.
   const stats = await getTeamStatsForSeason(env, league, season, teamId);
   const played = stats?.fixtures?.played?.total ?? 0;
-  if (played > 0) return { stats, season, usedFallback: false };
-
   const prevSeason = String(Number(season) - 1);
+
+  // Au-dela de 12 matchs, la saison en cours se suffit a elle-meme.
+  if (played >= 12) return { stats, season, usedFallback: false };
+
   const prevStats = await getTeamStatsForSeason(env, league, prevSeason, teamId);
   const prevPlayed = prevStats?.fixtures?.played?.total ?? 0;
+
+  if (played > 0 && prevPlayed > 0) {
+    const m = melangeStats(stats, prevStats);
+    return { stats: m.stats, season, usedFallback: false, melange: true,
+             nNew: m.nNew, nOld: m.nOld, prevSeason };
+  }
+  if (played > 0) return { stats, season, usedFallback: false };
   if (prevPlayed > 0) return { stats: prevStats, season: prevSeason, usedFallback: true };
 
   // Ni la saison demandée ni la précédente n'ont de matchs pour cette
