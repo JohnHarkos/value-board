@@ -39,7 +39,7 @@ body.sportmode .modesw .dot{background:var(--gold);box-shadow:0 0 7px var(--gold
 /* Import manuel : replie visuellement, reste accessible au clavier */
 #importWrap,#codeWrap{opacity:.4;font-size:12px}
 #importWrap:hover,#codeWrap:hover{opacity:1}
-#v-analyse > section:first-of-type,#lgAutoWrap{display:none}
+#v-analyse > section:first-of-type{display:none}
 section.repliable > *:not(.eyebrow){display:none}
 section.repliable.ouvert > *{display:block}
 section.repliable > .eyebrow{cursor:pointer;display:block}
@@ -174,7 +174,9 @@ select:disabled{opacity:.5;cursor:not-allowed}
 .axis{height:4px;background:var(--ink3);border-radius:2px;position:relative;overflow:hidden}
 .axis i{position:absolute;top:0;bottom:0;border-radius:2px}
 .axis .mid{left:50%;width:1px;background:var(--line)}
-.pos{color:var(--gold)}.neg{color:var(--rose)}.neu{color:var(--muted)}
+.pos{color:#4ADE80}.neg{color:#F87171}.neu{color:var(--muted)}
+body.sportmode .pos{color:#4ADE80}
+body.sportmode .neg{color:#F87171}
 .tag{display:inline-block;font:600 9px/1 var(--mono);letter-spacing:.13em;text-transform:uppercase;
      padding:4px 6px;border-radius:4px;margin-left:6px}
 .tag.go{background:rgba(224,164,43,.16);color:var(--gold)}
@@ -638,15 +640,22 @@ let bets=[];
 let lastPicks=[];
 // 'double' = buts reels ET xG doivent valider. 'sport' = buts reels seuls.
 let analysisMode='double';
+let xgIndispo = false;
 // Regle de validation unique. En mode sport, le xG (vB) est ignore :
 // seule la lecture buts reels (vA) valide un marche.
 // En mode sport le xG ne valide plus rien : on ne l'affiche plus dans
 // les listes. Il reste calcule, et une alerte apparait si l'ecart entre
 // les deux lectures depasse 20 points.
-const epureSport = () => analysisMode==='sport';
+const epureSport = () => analysisMode==='sport' || xgIndispo;
 const MAX_DIVERGENCE = 20;
 function confirmeMode(p, E){
   if (p.suspect) return false;
+  // Coherence avec le verdict : si les donnees sont jugees insuffisantes,
+  // aucun marche ne doit porter l etiquette "a jouer" non plus.
+  if (typeof donneesInsuffisantes !== 'undefined' && donneesInsuffisantes) return false;
+  // Pas de vrais xG : une seule lecture existe, la double validation et le
+  // veto de divergence n'ont plus de sens.
+  if (xgIndispo) return p.vA>=E;
   if (analysisMode !== 'sport') return p.vA>=E && p.vB>=E;
   if (p.vA < E) return false;
   if (Math.abs(p.vA - p.vB) >= MAX_DIVERGENCE && p.vB < 0) return false;
@@ -1116,6 +1125,12 @@ async function runAutoFetch(){
     // vidés ici).
     const statsFailed=(data.warnings||[]).some(w=>w.startsWith('stats (API-Football)'));
     const xgFailed=(data.warnings||[]).some(w=>w.startsWith('xG (Understat)'));
+    // Understat ne couvre que 6 championnats. Ailleurs (Portugal, Pays-Bas,
+    // promus de Liga...), le champ xG retombe sur la moyenne du championnat.
+    // Ce n'est alors PAS une seconde lecture : comparer l'equipe reelle a une
+    // equipe moyenne fabrique de fausses contradictions. On le signale pour
+    // que le reste de l'app cesse de traiter ce chiffre comme une validation.
+    xgIndispo = (data.warnings||[]).some(w=>/non couvert par Understat/i.test(w));
     const oddsFailed=(data.warnings||[]).some(w=>w.startsWith('cotes'));
     if(statsFailed) ['a1','a2','a3','a4'].forEach(clearField);
     if(xgFailed) ['b1','b2','b3','b4'].forEach(clearField);
