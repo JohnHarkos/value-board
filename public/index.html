@@ -649,6 +649,9 @@ let lastPicks=[];
 // 'double' = buts reels ET xG doivent valider. 'sport' = buts reels seuls.
 let analysisMode='double';
 let xgIndispo = false;
+// Repere Pinnacle (no-vig) recu du serveur. REPERE seulement : le backtest
+// du 15/08 a montre qu acheter les ecarts vs Pinnacle perd (-1% a -13%).
+let pinnacleData = null;
 // Regle de validation unique. En mode sport, le xG (vB) est ignore :
 // seule la lecture buts reels (vA) valide un marche.
 // En mode sport le xG ne valide plus rien : on ne l'affiche plus dans
@@ -678,6 +681,39 @@ const MAX_DIVERGENCE = 20;
 const COTE_MIN_JOUABLE = 1.40;
 const COTE_MAX_JOUABLE = 2.10;
 function coteJouable(p){ return p.o >= COTE_MIN_JOUABLE && p.o <= COTE_MAX_JOUABLE; }
+// Ligne de repere Pinnacle sous chaque marche. Trois verdicts :
+//   --        : ecart normal (la commission du book, rien a signaler)
+//   CANDIDAT  : le book te paie >= 4 pts MIEUX que le no-vig Pinnacle --
+//               a verifier (fraicheur, blessures) avant d y croire
+//   PIEGE     : ecart >= 8 pts -- statistiquement une cote perimee, pas
+//               une aubaine (backtest : -12.95% sur les gros ecarts)
+const PIN_KEYMAP = { '1':'p1', 'X':'pX', '2':'p2', 'O25':'pO25', 'U25':'pU25' };
+// Valeur Pinnacle inline pour la ligne principale : troisieme voix a cote
+// du modele et du book. '—' quand The Odds API ne fournit pas ce marche
+// (BTTS, 1,5 buts : hors flux Pinnacle sur ce plan).
+function pinInline(p){
+  if (!pinnacleData) return '';
+  const champ = PIN_KEYMAP[p.k];
+  const v = champ ? pinnacleData[champ] : null;
+  if (v != null) return ' · Pinnacle ' + (v*100).toFixed(1) + '%';
+  if ((p.k==='O25'||p.k==='U25') && pinnacleData.ligneTotaux)
+    return ' · Pinnacle \u2014 (ligne ' + pinnacleData.ligneTotaux + ')';
+  return ' · Pinnacle \u2014';
+}
+function repereP(p){
+  if (!pinnacleData) return '';
+  const champ = PIN_KEYMAP[p.k];
+  if (!champ || pinnacleData[champ] == null) return '';
+  const pin = pinnacleData[champ] * 100;
+  const paye = 100 / p.o;
+  const ecart = pin - paye; // positif = le book te paie mieux que la reference
+  let verdict, coul;
+  if (ecart >= 8)      { verdict = 'PIEGE PROBABLE — cote sans doute perimee, verifie'; coul = '#F87171'; }
+  else if (ecart >= 4) { verdict = 'CANDIDAT — verifie blessures et fraicheur'; coul = '#4ADE80'; }
+  else                 { return ''; } // ecart normal : deja lisible inline
+  return '<div class="hint" style="margin-top:2px;color:'+coul+'">Ecart Pinnacle '
+    + (ecart>=0?'+':'') + ecart.toFixed(1) + ' pts → <b>' + verdict + '</b></div>';
+}
 function niveauCoherence(p){
   if (p.suspect) return null;
   const ecart = Math.abs(p.pA - 1/p.o) * 100;
@@ -1171,6 +1207,7 @@ async function runAutoFetch(){
     // une seconde lecture.
     const lgTxt = ($('lgName') ? $('lgName').value : '').toLowerCase();
     const COUVERTS = /premier league|epl|angleterre|la liga|laliga|espagne|bundesliga|allemagne|serie a|italie|ligue 1|france|rfpl|russie/;
+    pinnacleData = data.pinnacle || null;
     xgIndispo = !COUVERTS.test(lgTxt)
       || (data.warnings||[]).some(w=>/non couvert par Understat/i.test(w));
     const oddsFailed=(data.warnings||[]).some(w=>w.startsWith('cotes'));
@@ -1483,12 +1520,13 @@ function renderValues(picks,E,sane){
       : lo+'\u2013'+hi+'%';
     return '<div class="vrow">'+
       `<div class="vtop"><span class="vname">${p.label}${tag}${(function(){const n=niveauCoherence(p);return n==='vert'?'<span class="pastilleConf" title="Coherence forte : modele et book d accord a moins de 3 points, cote 1.50-1.75. ROI historique +4.9% sur 498 paris."></span>':n==='orange'?'<span class="pastilleOr" title="Coherence moyenne : accord a moins de 5 points, cote 1.45-1.85. ROI historique +1.7% sur 1423 paris."></span>':'';})()}</span><span class="vodd">cote ${fmt(p.o)}</span></div>`+
-      `<div class="vmeta">modèle ${modeleTxt} · bookmaker ${implied}% · `+
+      `<div class="vmeta">modèle ${modeleTxt} · bookmaker ${implied}%${pinInline(p)} · `+
       `<b class="${cl(p.vA)}">${p.vA>=0?'+':''}${p.vA.toFixed(1)}%</b>`+
       (epureSport()
         ? (Math.abs(p.vA-p.vB)>=20 ? ` <b style="color:var(--rose)">&#9888; xG : ${(p.pB*100).toFixed(0)}%</b>` : '')
         : ` / <b class="${cl(p.vB)}">${p.vB>=0?'+':''}${p.vB.toFixed(1)}%</b>`)+
       `</div>`+
+      repereP(p)+
       (p.suspect?'<div class="hint" style="margin-top:2px">Value irréaliste sur un marché réel — probablement une cote isolée/périmée chez un bookmaker plutôt qu\'une vraie opportunité. Vérifie le consensus avant de parier dessus.</div>':'')+
     '</div>';
   }).join('');

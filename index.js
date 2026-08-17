@@ -1584,6 +1584,12 @@ async function getOdds(env, sportKey, homeName, awayName) {
         }
       }
       if (mk.key === "totals" && mk.outcomes) {
+        // Pinnacle publie souvent une ligne asiatique (2.25, 2.75) plutot
+        // que 2.5. On ne compare QUE la ligne 2.5 -- comparer des lignes
+        // differentes serait comparer des paris differents. Quand 2.5 est
+        // absente, on note la ligne publiee pour l afficher cote app.
+        const points = [...new Set(mk.outcomes.map(o => o.point))];
+        if (!points.includes(2.5)) pinnacle.ligneTotaux = points[0];
         let iO = null, iU = null;
         mk.outcomes.forEach(o => {
           if (o.point !== 2.5) return;
