@@ -658,6 +658,17 @@ let pinnacleData = null;
 // les listes. Il reste calcule, et une alerte apparait si l'ecart entre
 // les deux lectures depasse 20 points.
 const epureSport = () => analysisMode==='sport' || xgIndispo;
+// Mode sport : le chiffre principal melange 70% xG + 30% buts reels. Mesure
+// sur 18893 predictions, 5 championnats : buts purs 0.5946, xG purs 0.5925,
+// 70% xG 0.5917 (optimum, plateau plat 40-80%). Le xG predit mieux que les
+// buts deja marques. Repli sur les buts seuls quand le xG manque (promus,
+// championnats hors Understat) : dans ce cas pB vaut pA cote serveur.
+const POIDS_XG = 0.70;
+function probaSport(p){
+  // xgIndispo => pB n est pas une vraie lecture xG : on garde les buts.
+  if (xgIndispo || p.pB == null) return p.pA;
+  return POIDS_XG * p.pB + (1 - POIDS_XG) * p.pA;
+}
 const MAX_DIVERGENCE = 20;
 
 // Pastille verte : signal coherent. Basee sur le backtest de 6 saisons --
@@ -1428,14 +1439,16 @@ function analyse(scroll){
     if(!o||o<1.01) return;
     const pA=sumIf(mA,mk.f), pB=sumIf(mB,mk.f);
     const vA=(pA*o-1)*100, vB=(pB*o-1)*100;
+    const pS = (xgIndispo || pB == null) ? pA : (0.70*pB + 0.30*pA);
+    const vS = (pS*o-1)*100;
     // Round 38 — un seul marché avec une value >40% (typiquement une
     // cote isolée chez un bookmaker parmi ceux consultés, pas forcément
     // une erreur de saisie) ne doit plus invalider les 4 AUTRES marchés
     // du match, qui n'ont rien à voir avec ce prix isolé. Le marché
     // suspect est marqué et exclu du "à jouer"/"meilleure value", mais le
     // reste de l'analyse continue normalement.
-    picks.push({k:mk.k,label:mk.label,o,pA,pB,vA,vB,
-      worst:(analysisMode==='sport'?vA:Math.min(vA,vB)), suspect:(vA>40||vB>40)});
+    picks.push({k:mk.k,label:mk.label,o,pA,pB,vA,vB,pS,vS,
+      worst:(analysisMode==='sport'?vS:Math.min(vA,vB)), suspect:(vA>40||vB>40)});
   });
 
   if(!picks.length){
@@ -1514,12 +1527,12 @@ function renderValues(picks,E,sane){
     // fourchette laisserait croire que les deux comptent. On montre donc
     // un seul chiffre, et on explicite le xG uniquement s il contredit.
     const modeleTxt = epureSport()
-      ? (p.pA*100).toFixed(0)+'%'
+      ? (probaSport(p)*100).toFixed(0)+'%'
       : lo+'\u2013'+hi+'%';
     return '<div class="vrow">'+
       `<div class="vtop"><span class="vname">${p.label}${tag}${(function(){const n=niveauCoherence(p);return n==='vert'?'<span class="pastilleConf" title="Coherence forte : modele et book d accord a moins de 3 points, cote 1.50-1.75. ROI historique +4.9% sur 498 paris."></span>':n==='orange'?'<span class="pastilleOr" title="Coherence moyenne : accord a moins de 5 points, cote 1.45-1.85. ROI historique +1.7% sur 1423 paris."></span>':'';})()}</span><span class="vodd">cote ${fmt(p.o)}</span></div>`+
       `<div class="vmeta">modèle ${modeleTxt} · bookmaker ${implied}%${pinInline(p)} · `+
-      `<b class="${cl(p.vA)}">${p.vA>=0?'+':''}${p.vA.toFixed(1)}%</b>`+
+      `<b class="${cl(epureSport()?p.vS:p.vA)}">${(epureSport()?p.vS:p.vA)>=0?'+':''}${(epureSport()?p.vS:p.vA).toFixed(1)}%</b>`+
       (epureSport()
         ? (Math.abs(p.vA-p.vB)>=20 ? ` <b style="color:var(--rose)">&#9888; xG : ${(p.pB*100).toFixed(0)}%</b>` : '')
         : ` / <b class="${cl(p.vB)}">${p.vB>=0?'+':''}${p.vB.toFixed(1)}%</b>`)+
