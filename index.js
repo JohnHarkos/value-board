@@ -388,7 +388,8 @@ async function handleLookup(params, env) {
   return {
     homeName, awayName, league: leagueName, season,
     values: buildValues(statsPart, xgPart, oddsPart),
-    oddsSpread: oddsPart?.spread || null, // {marché: {spread, count}} — dispersion entre bookmakers
+    oddsSpread: oddsPart?.spread || null,
+    pinnacle: oddsPart?.pinnacle || null, // {marché: {spread, count}} — dispersion entre bookmakers
     oddsBestBook: oddsPart?.bestBook || null, // {marché: nom du bookmaker offrant la meilleure cote}
     injuries: statsPart?.injuries || null, // Round 22 — {home: [...], away: [...]}, purement informatif
     importCode: buildImportCode(homeName, awayName, statsPart, xgPart, oddsPart),
@@ -495,6 +496,7 @@ async function handleMatch(params, env) {
     homeName, awayName,
     values: buildValues(statsPart, xgPart, oddsPart),
     oddsSpread: oddsPart?.spread || null,
+    pinnacle: oddsPart?.pinnacle || null,
     oddsBestBook: oddsPart?.bestBook || null,
     injuries: statsPart?.injuries || null, // Round 22
     importCode: buildImportCode(homeName, awayName, statsPart, xgPart, oddsPart),
@@ -1286,7 +1288,13 @@ async function resolveSportKey(env, leagueName) {
 // désaccord entre peu de sources pour l'écart% de spread() de s'affoler),
 // et certains marchés moins standards (ex. total 1,5 but) peuvent
 // disparaître plus souvent faute d'être proposés par ces 3 précisément.
-const PREFERRED_BOOKMAKERS = "winamax_fr,betclic_fr,pmu_fr,bet365,unibet_fr,bwin";
+// pinnacle ajoute le 17/08/2026 : REPERE uniquement (non jouable depuis la
+// France). Extrait AVANT la collecte des cotes jouables -- il ne doit
+// jamais devenir "meilleure cote". Le backtest du 15/08 a montre qu acheter
+// les ecarts vs Pinnacle PERD (-0.97% a +2, -12.95% a +10) : c est un
+// repere de contexte (no-vig = probabilite de reference), pas un signal.
+const PREFERRED_BOOKMAKERS = "winamax_fr,betclic_fr,pmu_fr,bet365,unibet_fr,bwin,pinnacle";
+const PINNACLE_REPERE = /^pinnacle$/i;
 
 // Voir GET /api/journee ci-dessus.
 const JOURNEE_MIENS = /^(betclic|winamax|pmu)\s*\(?fr\)?$/i;
@@ -1555,7 +1563,43 @@ async function getOdds(env, sportKey, homeName, awayName) {
   // parsing" — question restée ouverte malgré le correctif précédent
   // (aucune erreur levée, mais aucune cote totals extraite non plus).
   const marketsSeenPerBook = {};
+  // Extraction Pinnacle (repere) -- no-vig par marche : implicites divises
+  // par leur somme, marge retiree. C est la meilleure estimation publique
+  // de la vraie probabilite.
+  const pinnacle = { p1: null, pX: null, p2: null, pO25: null, pU25: null };
+  const pinBk = match.bookmakers.find(bk => PINNACLE_REPERE.test(bk.title || ""));
+  if (pinBk) {
+    (pinBk.markets || []).forEach(mk => {
+      if (mk.key === "h2h" && mk.outcomes && mk.outcomes.length >= 3) {
+        let iH = null, iD = null, iA = null;
+        mk.outcomes.forEach(o => {
+          const imp = 1 / o.price;
+          if (o.name === match.home_team) iH = imp;
+          else if (o.name === match.away_team) iA = imp;
+          else iD = imp;
+        });
+        if (iH && iD && iA) {
+          const tot = iH + iD + iA;
+          pinnacle.p1 = iH / tot; pinnacle.pX = iD / tot; pinnacle.p2 = iA / tot;
+        }
+      }
+      if (mk.key === "totals" && mk.outcomes) {
+        let iO = null, iU = null;
+        mk.outcomes.forEach(o => {
+          if (o.point !== 2.5) return;
+          if (/over/i.test(o.name)) iO = 1 / o.price;
+          if (/under/i.test(o.name)) iU = 1 / o.price;
+        });
+        if (iO && iU) {
+          const tot = iO + iU;
+          pinnacle.pO25 = iO / tot; pinnacle.pU25 = iU / tot;
+        }
+      }
+    });
+  }
+
   match.bookmakers.forEach(bk => {
+    if (PINNACLE_REPERE.test(bk.title || "")) return; // repere, jamais cote jouable
     marketsSeenPerBook[bk.title] = bk.markets.map(mk => mk.key).join("+") || "(aucun marché)";
     bk.markets.forEach(mk => {
       if (mk.key === "h2h") mk.outcomes.forEach(o => {
@@ -1694,6 +1738,7 @@ Object.keys(collect).forEach(k => {
   });
   out.spread = spread;
   out.bestBook = bestBook;
+  out.pinnacle = pinnacle; // repere no-vig, extrait avant la collecte
   if (offBetclicMarkets.length) {
     const labels = offBetclicMarkets.map(k => marketLabels[k] || k).join(", ");
     const betclicMsg = "cote(s) hors Betclic/Winamax (marche indisponible chez tes books) : "
