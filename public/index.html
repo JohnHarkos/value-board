@@ -723,7 +723,7 @@ let teamNames=[];
 
 /* ---------- modèle : DÉBUT (moteur pur, sans dépendance au DOM — testé
    automatiquement, voir tests/engine.test.js dans les livrables) ---------- */
-const K=8;
+const K=3; // etait 8. Avec le melange des deux saisons (poids 2), le modele dispose de ~19 matchs des la 1re journee : moins besoin de tirer vers la moyenne du championnat. Mesure sur 1016 predictions : Brier 0.5840 (K=8) -> 0.5821 (K=3). Plateau plat entre K=2 et K=5.
 const fact=n=>{let r=1;for(let i=2;i<=n;i++)r*=i;return r};
 const pois=(k,l)=>Math.exp(-l)*Math.pow(l,k)/fact(k);
 const shrink=(r,n)=>{n=Math.max(1,n);return (n*r+K)/(n+K)};

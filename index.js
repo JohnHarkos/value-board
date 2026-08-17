@@ -794,7 +794,7 @@ async function resolveTeam(env, teamName, leagueId, season) {
 // récente.
 /* ---------- pondération temporelle : DÉBUT (fonction pure, testée
    automatiquement, voir tests/decay.test.js) ---------- */
-const HALF_LIFE_DAYS = 60;
+const HALF_LIFE_DAYS = 270; // etait 60. Mesure sur 9586 predictions, 8 championnats, 2 paires de saisons : Brier 0.6021 (60j) -> 0.5939 (270j). A 60 jours, un match de la saison passee pesait 1.5% d un match recent, ce qui annulait le melange des deux saisons. Plateau plat entre 270 et 365 j ; 270 retenu pour rester un peu plus reactif.
 const DECAY_RATE = Math.log(2) / HALF_LIFE_DAYS;
 
 function weightedRecentAverage(rows, dateOf, valueOf, referenceDate) {
@@ -926,6 +926,24 @@ async function getStandingsWithFallback(env, league, season) {
   return { table, season, usedFallback: false };
 }
 
+
+// Complete l historique de la saison en cours avec la precedente quand il
+// est trop court. Sans ca, la ponderation par recence (Round 15) recalculait
+// a1..a4 sur les seuls matchs de la saison courante -- 1 match en aout -- et
+// ecrasait le melange des deux saisons fait plus haut. Les matchs recents
+// sont comptes deux fois : meme poids que melangeStats.
+async function fixturesAvecMelange(env, league, season, teamId) {
+  const recents = await getRecentFixtures(env, league, season, teamId);
+  if (recents.length >= 12) return recents;
+  try {
+    const prev = await getRecentFixtures(env, league, String(Number(season) - 1), teamId);
+    if (!prev.length) return recents;
+    return [].concat(recents, recents, prev);
+  } catch (err) {
+    return recents;
+  }
+}
+
 async function getGoalStats(env, league, season, homeId, awayId) {
   // Cache court (1h) : contrairement aux IDs de ligue/équipe, les stats et
   // le classement changent à chaque journée jouée — on ne veut pas d'un
@@ -970,8 +988,8 @@ async function getGoalStats(env, league, season, homeId, awayId) {
   // rester cohérent avec les stats déjà récupérées. Toujours séquentiel,
   // même raison de rate-limit que les appels au-dessus.
   try {
-    const homeFixtures = await getRecentFixtures(env, league, homeResult.season, homeId);
-    const awayFixtures = await getRecentFixtures(env, league, awayResult.season, awayId);
+    const homeFixtures = await fixturesAvecMelange(env, league, homeResult.season, homeId);
+    const awayFixtures = await fixturesAvecMelange(env, league, awayResult.season, awayId);
     const homeAtHome = homeFixtures.filter(f => f.teams?.home?.id === homeId);
     const awayAtAway = awayFixtures.filter(f => f.teams?.away?.id === awayId);
     const dateOf = f => f.fixture?.date;
@@ -1066,16 +1084,34 @@ async function getUnderstatTeamWithFallback(slug, season, teamName, venueSide) {
   // n'a aucun match de ce côté (domicile ou extérieur) pour la saison
   // demandée (généralement avant la 1ère journée), on retombe sur la
   // saison précédente complète plutôt que de renvoyer un xG vide.
+  // Modifie le 16/08/2026 : meme melange que cote buts reels. Sans ca, les
+  // xG restaient sur la saison en cours (1 match en aout) pendant que les
+  // buts portaient deja sur deux saisons -- les deux lectures ne parlaient
+  // plus du meme echantillon et l app affichait des contradictions
+  // permanentes. Poids 2 : chaque match de la saison en cours est compte
+  // deux fois dans l historique, ce qui revient au meme calcul de moyenne.
   const teamsData = await getUnderstatTeamsForSeason(slug, season);
   const team = findUnderstatTeam(teamsData, teamName);
-  const hasRows = team && team.history && team.history.some(m => m.h_a === venueSide);
-  if (hasRows) return { team, season, usedFallback: false };
-
+  const rows = (team && team.history) ? team.history.filter(m => m.h_a === venueSide) : [];
   const prevSeason = String(Number(season) - 1);
-  const prevTeamsData = await getUnderstatTeamsForSeason(slug, prevSeason);
-  const prevTeam = findUnderstatTeam(prevTeamsData, teamName);
-  const prevHasRows = prevTeam && prevTeam.history && prevTeam.history.some(m => m.h_a === venueSide);
-  if (prevHasRows) return { team: prevTeam, season: prevSeason, usedFallback: true };
+
+  if (rows.length >= 12) return { team, season, usedFallback: false };
+
+  let prevTeam = null, prevRows = [];
+  try {
+    const prevTeamsData = await getUnderstatTeamsForSeason(slug, prevSeason);
+    prevTeam = findUnderstatTeam(prevTeamsData, teamName);
+    prevRows = (prevTeam && prevTeam.history) ? prevTeam.history.filter(m => m.h_a === venueSide) : [];
+  } catch (err) { /* best-effort : sans saison precedente on garde ce qu on a */ }
+
+  if (rows.length > 0 && prevRows.length > 0) {
+    const melangeXG = JSON.parse(JSON.stringify(team));
+    melangeXG.history = [].concat(rows, rows, prevRows);
+    return { team: melangeXG, season, usedFallback: false, melange: true,
+             nNew: rows.length, nOld: prevRows.length, prevSeason };
+  }
+  if (rows.length > 0) return { team, season, usedFallback: false };
+  if (prevRows.length > 0) return { team: prevTeam, season: prevSeason, usedFallback: true };
 
   // Ni cette saison ni la précédente n'ont de matchs pour ce côté (ex.
   // équipe fraîchement promue, jamais vue par Understat) — on renvoie ce
