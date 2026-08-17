@@ -868,6 +868,39 @@ function melangeStats(sNew, sOld) {
   return { stats: out, melange: true, nNew: nNew.home + nNew.away, nOld: nOld.home + nOld.away };
 }
 
+
+// Repli division inferieure pour les promus. Mesure le 16/08/2026 sur 41
+// promus (5 pays, 3 saisons) : en montant, ils marquent 32% de moins
+// (x0.683) et encaissent 98% de plus (x1.976). Backtest sur leurs 10
+// premiers matchs de D1 :
+//   moyenne du championnat (avant) : Brier 0.6422
+//   stats D2 brutes                : Brier 0.7520  <- PIRE que l aveuglement
+//   stats D2 x facteurs mesures    : Brier 0.5894  <- retenu
+// Ne JAMAIS utiliser les stats D2 sans ces facteurs.
+const FACTEUR_PROMU_ATT = 0.683;
+const FACTEUR_PROMU_DEF = 1.976;
+const LIGUE_INFERIEURE = {
+  "140": 141, // La Liga -> Segunda
+  "39": 40,   // Premier League -> Championship
+  "135": 136, // Serie A -> Serie B
+  "78": 79,   // Bundesliga -> 2. Bundesliga
+  "61": 62,   // Ligue 1 -> Ligue 2
+  "94": 95    // Primeira Liga -> Liga Portugal 2
+};
+
+function corrigePromu(sD2) {
+  const out = JSON.parse(JSON.stringify(sD2));
+  const fix = (v, f) => {
+    const x = Number(v);
+    return isFinite(x) ? (x * f).toFixed(2) : v;
+  };
+  out.goals.for.average.home     = fix(out.goals.for.average.home,     FACTEUR_PROMU_ATT);
+  out.goals.for.average.away     = fix(out.goals.for.average.away,     FACTEUR_PROMU_ATT);
+  out.goals.against.average.home = fix(out.goals.against.average.home, FACTEUR_PROMU_DEF);
+  out.goals.against.average.away = fix(out.goals.against.average.away, FACTEUR_PROMU_DEF);
+  return out;
+}
+
 async function getTeamStatsWithFallback(env, league, season, teamId) {
   // Round 16 — repli sur la saison précédente. Avant la 1ère journée d'une
   // saison, API-Football répond valablement (200) mais avec 0 match joué :
@@ -890,13 +923,29 @@ async function getTeamStatsWithFallback(env, league, season, teamId) {
   const prevStats = await getTeamStatsForSeason(env, league, prevSeason, teamId);
   const prevPlayed = prevStats?.fixtures?.played?.total ?? 0;
 
+  // Promu probable : rien dans cette ligue la saison passee. On tente la
+  // division inferieure, corrigee par les facteurs mesures.
+  let d2Corrige = null;
+  if (prevPlayed === 0 && LIGUE_INFERIEURE[String(league)]) {
+    try {
+      const sD2 = await getTeamStatsForSeason(env, LIGUE_INFERIEURE[String(league)], prevSeason, teamId);
+      if ((sD2?.fixtures?.played?.total ?? 0) > 0) d2Corrige = corrigePromu(sD2);
+    } catch (err) { /* best-effort : sans D2 on retombe sur l existant */ }
+  }
+
   if (played > 0 && prevPlayed > 0) {
     const m = melangeStats(stats, prevStats);
     return { stats: m.stats, season, usedFallback: false, melange: true,
              nNew: m.nNew, nOld: m.nOld, prevSeason };
   }
+  if (played > 0 && d2Corrige) {
+    const m = melangeStats(stats, d2Corrige);
+    return { stats: m.stats, season, usedFallback: false, melange: true, promu: true,
+             nNew: m.nNew, nOld: m.nOld, prevSeason };
+  }
   if (played > 0) return { stats, season, usedFallback: false };
   if (prevPlayed > 0) return { stats: prevStats, season: prevSeason, usedFallback: true };
+  if (d2Corrige) return { stats: d2Corrige, season: prevSeason, usedFallback: true, promu: true };
 
   // Ni la saison demandée ni la précédente n'ont de matchs pour cette
   // équipe (ex. équipe fraîchement promue, jamais vue dans cette
@@ -965,6 +1014,12 @@ async function getGoalStats(env, league, season, homeId, awayId) {
   }
   if (awayResult.usedFallback) {
     warnings.push("repli sur la saison " + awayResult.season + " pour l'équipe à l'extérieur (aucun match joué en " + season + ")");
+  }
+  if (homeResult.promu) {
+    warnings.push("équipe à domicile promue : stats de division inférieure corrigées (attaque x0.68, défense x1.98 — facteurs mesurés sur 41 promus)");
+  }
+  if (awayResult.promu) {
+    warnings.push("équipe à l'extérieur promue : stats de division inférieure corrigées (attaque x0.68, défense x1.98 — facteurs mesurés sur 41 promus)");
   }
 
   const standingsResult = await getStandingsWithFallback(env, league, season);
