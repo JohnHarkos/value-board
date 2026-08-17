@@ -696,8 +696,6 @@ function pinInline(p){
   const champ = PIN_KEYMAP[p.k];
   const v = champ ? pinnacleData[champ] : null;
   if (v != null) return ' · Pinnacle ' + (v*100).toFixed(1) + '%';
-  if ((p.k==='O25'||p.k==='U25') && pinnacleData.ligneTotaux)
-    return ' · Pinnacle \u2014 (ligne ' + pinnacleData.ligneTotaux + ')';
   return ' · Pinnacle \u2014';
 }
 function repereP(p){
