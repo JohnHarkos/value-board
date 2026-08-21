@@ -1429,6 +1429,35 @@ function scheduleAuto(){
   autoTimer=setTimeout(()=>analyse(false),450);
 }
 
+async function logAutoSignals(picks, sane, scroll){
+  // Ajoute le 21/08/2026 -- journal vivant : enregistre automatiquement
+  // chaque marche calcule par une analyse deliberee (Chercher
+  // automatiquement, import de code, bouton Calc -- jamais le recalcul
+  // en direct pendant la frappe, scroll=false), a condition que sane
+  // soit vrai (meme garde-fou que l'affichage : jamais logger des
+  // lambdas qui "ne ressemblent pas a un match de football"). Une ligne
+  // par marche, pas par match, pour valider la regle de coherence
+  // marche par marche. Anti-doublon : jour+match+marche -- la premiere
+  // analyse du jour reste la reference, jamais ecrasee par une
+  // re-analyse plus tard le meme jour (coherent avec l'usage prevu du
+  // champ closingOdd).
+  if(!scroll || !sane || !picks || !picks.length) return;
+  const today = new Date().toISOString().slice(0,10);
+  const mName = matchName();
+  const existingKeys = new Set(bets.filter(b=>b.auto && b.date===today && b.match===mName).map(b=>b.market));
+  let added = false;
+  picks.forEach(p=>{
+    if(existingKeys.has(p.label)) return;
+    bets.unshift({
+      id: Date.now()+'_'+p.k, date: today, match: mName, market: p.label,
+      odd: p.o, stake: 0, vA: p.vA, vB: p.vB, status: 'auto',
+      kickoff: '', book: '', mode: (typeof analysisMode!=='undefined'?analysisMode:'double'),
+      closingOdd: null, auto: true, worst: p.worst, suspect: p.suspect
+    });
+    added = true;
+  });
+  if(added){ await Store.set('vb3_bets', bets); renderJournal(); }
+}
 function analyse(scroll){
   const sane=refreshLam();
   const A=setA(), B=setB();
@@ -1471,7 +1500,7 @@ function analyse(scroll){
     if(ja!==jb) return jb-ja;
     return b.worst-a.worst;
   });
-  lastPicks=picks;
+  lastPicks=picks; logAutoSignals(picks, sane, scroll);
   render(picks,sane);
   if($('detailWrap'))$('detailWrap').style.display='block';
   if($('saveWrap'))$('saveWrap').style.display='block';

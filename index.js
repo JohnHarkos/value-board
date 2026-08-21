@@ -1271,6 +1271,22 @@ async function resolveSportKey(env, leagueName) {
   if (!res.ok) throw new Error("HTTP " + res.status + " (liste des sports) — clé longueur=" + (env.ODDS_API_KEY || "").length);
   const list = await res.json();
   const n = norm(leagueName);
+  // Alias : certains championnats ont un titre The Odds API qui ne partage
+  // aucun mot avec le nom API-Football. Ex. "Premier League" cote "EPL" —
+  // aucune inclusion mutuelle possible. On force la cle dans ces cas.
+  const ALIAS = {
+    "premierleague": "soccer_epl",
+    "laliga": "soccer_spain_la_liga",
+    "seriea": "soccer_italy_serie_a",
+    "bundesliga": "soccer_germany_bundesliga",
+    "ligue1": "soccer_france_ligue_one",
+    "primeiraliga": "soccer_portugal_primeira_liga",
+    "eredivisie": "soccer_netherlands_eredivisie"
+  };
+  if (ALIAS[n]) {
+    const forced = list.find(s => s.key === ALIAS[n]);
+    if (forced) { await cacheSet(env, cacheKey, forced.key, 2592000); return forced.key; }
+  }
   const match = list.find(s => s.group === "Soccer" && (norm(s.title).includes(n) || n.includes(norm(s.title))));
   if (!match) throw new Error("championnat introuvable: " + leagueName);
   await cacheSet(env, cacheKey, match.key, 2592000); // 30 jours
