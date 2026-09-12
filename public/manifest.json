@@ -1,6 +1,6 @@
 {
-  "name": "Value Board",
-  "short_name": "Value Board",
+  "name": "Boussole",
+  "short_name": "Boussole",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",

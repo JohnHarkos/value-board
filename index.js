@@ -120,6 +120,60 @@ app.use((req, res, next) => {
   res.status(401).json({ error: "Clé d'accès manquante ou invalide (paramètre ?key=...)." });
 });
 
+// Ajoute le 11/09/2026 -- reglement automatique du journal : recupere le
+// score final d'un match TERMINE (statut "FT" chez API-Football) pour que
+// le frontend puisse determiner tout seul si chaque marche loggue a gagne
+// ou perdu, en reutilisant les memes fonctions f(i,j) du tableau MARKETS
+// qui servent deja au calcul des probabilites -- zero nouvelle logique
+// metier, juste une nouvelle source (score reel au lieu d'une distribution).
+async function getMatchResult(env, leagueName, season, homeName, awayName, dateStr) {
+  const league = await resolveLeague(env, leagueName, season);
+  const homeTeam = await resolveTeam(env, homeName, league.leagueId, season);
+  const awayTeam = await resolveTeam(env, awayName, league.leagueId, season);
+  // Corrige le 12/09/2026 -- dateStr peut etre la date d'AJOUT au journal
+  // cote frontend, pas forcement le vrai jour du coup d'envoi (analyse
+  // faite la veille du match, confirme en direct sur Jeonbuk Motors vs FC
+  // Seoul : pari logge le 11, match reellement joue le 12 -- recherche
+  // exacte sur le 11 seul ne trouvait rien). Fenetre elargie (-1 a +2
+  // jours) plutot qu'un jour unique et precis, pour rester robuste peu
+  // importe quelle date exacte est envoyee.
+  const d0 = new Date(dateStr + "T00:00:00Z");
+  const fromStr = new Date(d0.getTime() - 1 * 86400000).toISOString().slice(0, 10);
+  const toStr = new Date(d0.getTime() + 2 * 86400000).toISOString().slice(0, 10);
+  const res = await apiFootballGet(env, "/fixtures", { league: league.leagueId, season, team: homeTeam.id, from: fromStr, to: toStr });
+  if (!res || !res.length) throw new Error("aucun match trouve autour de cette date pour " + homeName);
+  const fx = res.find(r => r.teams.home.id === awayTeam.id || r.teams.away.id === awayTeam.id);
+  if (!fx) throw new Error("match contre " + awayName + " introuvable autour de cette date");
+  const statusShort = fx.fixture.status.short;
+  if (statusShort !== "FT" && statusShort !== "AET" && statusShort !== "PEN") {
+    throw new Error("match pas encore termine (statut: " + statusShort + ")");
+  }
+  // homeGoals/awayGoals toujours dans le sens "equipe a domicile tapee par
+  // l'utilisateur", peu importe l'ordre home/away retourne par l'API pour
+  // CE fixture precis (rare mais possible en cas d'inversion domicile/
+  // exterieur d'une saison a l'autre pour la meme paire d'equipes).
+  const homeIsFixtureHome = fx.teams.home.id === homeTeam.id;
+  return {
+    homeGoals: homeIsFixtureHome ? fx.goals.home : fx.goals.away,
+    awayGoals: homeIsFixtureHome ? fx.goals.away : fx.goals.home,
+    status: statusShort,
+  };
+}
+
+app.get("/api/result", async (req, res) => {
+  try {
+    const params = new URLSearchParams(req.query);
+    const home = params.get("home"), away = params.get("away"), league = params.get("league"), date = params.get("date");
+    const season = params.get("season") || String(new Date().getFullYear());
+    const missing = ["home", "away", "league", "date"].filter(k => !params.get(k));
+    if (missing.length) throw new Error("Parametres manquants: " + missing.join(", "));
+    const result = await getMatchResult(env, league, season, home, away, date);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
 app.get("/api/lookup", async (req, res) => {
   try {
     const params = new URLSearchParams(req.query);
@@ -305,7 +359,11 @@ async function handleLookup(params, env) {
   // partagent bien la même limite API-Football.
   const [statsResult, xgResult, oddsResult, avgResult] = await Promise.allSettled([
     (async () => {
-      const league = await resolveLeague(env, leagueName, season);
+      // Le pays tape (ou devine juste au-dessus via la sonde resolveLeague)
+      // depart maintenant toute ambiguite de championnat (ex. "Serie B"
+      // Italie vs Bresil) au lieu de dependre uniquement d'alias ajoutes
+      // au coup par coup a chaque nouvelle collision decouverte.
+      const league = await resolveLeague(env, leagueName, season, fsCountry);
       const homeTeam = await resolveTeam(env, homeName, league.leagueId, season);
       const awayTeam = await resolveTeam(env, awayName, league.leagueId, season);
       const stats = await getGoalStats(env, league.leagueId, season, homeTeam.id, awayTeam.id);
@@ -347,8 +405,26 @@ async function handleLookup(params, env) {
       return await getXGViaLeague(slug, season, homeName, awayName);
     })(),
     (async () => {
-      const sportKey = await resolveSportKey(env, leagueName);
-      return await getOddsCached(env, sportKey, homeName, awayName);
+      // Meme departage par pays que pour resolveLeague ci-dessus, cote
+      // The Odds API cette fois (ex. "Super Lig" Turquie vs "Superliga"
+      // Danemark).
+      try {
+        const sportKey = await resolveSportKey(env, leagueName, fsCountry);
+        return await getOddsCached(env, sportKey, homeName, awayName);
+      } catch (err) {
+        // Ajoute le 07/09/2026 -- championnat absent de The Odds API dans
+        // sa totalite (ex. Colombie, confirme en direct : "championnat
+        // introuvable: Primera A"), donc getOddsCached n'est jamais
+        // atteinte. Dernier recours : OddsPapi comme source COMPLETE
+        // (1N2 inclus), pas seulement en complement partiel comme pour les
+        // championnats deja couverts par The Odds API.
+        try {
+          const oddsPapiOut = await getOddsFromOddsPapiOnly(env, homeName, awayName);
+          return { odds: oddsPapiOut, warning: oddsPapiOut.warning };
+        } catch (err2) {
+          throw err; // erreur d'origine, plus parlante que celle d'OddsPapi seul
+        }
+      }
     })(),
     fsCountry ? getLeagueAverages(leagueName, fsCountry, season) : Promise.resolve(null),
   ]);
@@ -638,7 +714,7 @@ async function apiFootballGet(env, path, qs) {
   // Pause avant chaque appel : filet de sécurité en plus du cache ci-dessus,
   // pour les appels qui ne peuvent pas être évités (premier lookup d'une
   // équipe/ligue jamais vue).
-  await sleep(1100);
+  await sleep(350); // Reduit de 1100ms le 05/09/2026 -- IP dediee confirmee, quota large (299/300 req/min), retrouve a 1100ms malgre un fix documente et teste le 29/07/2026 (tres probablement une regression, jamais une decision deliberee documentee). Filet de securite (3 tentatives, 2s/4s) inchange en cas de vrai rate limit.
   // Correctif (14/08/2026) : le paramètre "search" plante avec un accent
   // ("Vitória" -> 400 côté API-Football). On le nettoie ici, au point
   // d'entrée unique de tous les appels API-Football, plutôt que dans
@@ -687,26 +763,59 @@ async function apiFootballGet(env, path, qs) {
   throw lastErr;
 }
 
-async function resolveLeague(env, leagueName, season) {
-  // L'ID d'une ligue ne change jamais — cache long (30 jours). C'est le
-  // premier appel de la chaîne, donc le premier gain, et le plus rentable
-  // puisqu'il est identique pour tous les utilisateurs qui tapent "liga mx".
-  const cacheKey = "league:" + norm(leagueName);
+// Ajoute le 07/09/2026 -- certains noms de championnat existent a
+// l'identique dans plusieurs pays (ex. "Serie B" en Italie ET au Bresil,
+// confirme en direct sur Palermo vs Sampdoria : les deux obtenaient un
+// score parfaitement egal dans resolveLeague -- nom exact + type League +
+// saison presente -- et l'ordre de l'API-Football (Bresil avant Italie
+// dans la reponse /leagues) tranchait au hasard, choisissant le mauvais
+// pays sans aucun signal d'erreur). Cette table ne sert qu'a departager
+// une egalite parfaite : un petit bonus de score est applique si le pays
+// correspond a celui attendu pour ce nom de championnat.
+// Table de repli statique : ne sert que si l'utilisateur laisse le champ
+// "Pays" vide. Quand il est rempli, c'est ce pays-la qui prime toujours
+// (voir countryHint dans resolveLeague ci-dessous) -- generique pour tout
+// futur championnat ambigu, pas seulement "Serie B".
+const LEAGUE_COUNTRY_HINTS = {
+  "serieb": "Italy",
+};
+async function resolveLeague(env, leagueName, season, countryHint) {
+  // L'ID d'une ligue ne change jamais — cache long (30 jours). La cle
+  // inclut desormais le pays indice : sans ca, la premiere personne (ou le
+  // premier essai) a resoudre "Serie B" figerait le resultat en cache pour
+  // 30 jours, peu importe le pays demande ensuite par quelqu'un d'autre.
+  const chRaw = (countryHint || "").trim();
+  const cacheKey = "league:" + norm(leagueName) + ":" + norm(chRaw);
   const cached = await cacheGet(env, cacheKey);
   if (cached) return cached;
 
-  const res = await apiFootballGet(env, "/leagues", { search: leagueName });
+  // Ajoute le 07/09/2026 -- le champ Championnat de l'app affiche le nom
+  // suivi du pays ("Süper Lig — Turkey", tiret cadratin inclus). Envoyer ce
+  // texte tel quel a /leagues (recherche libre API-Football) renvoyait
+  // ZERO resultat (confirme en direct : "Süper Lig — Turkey" => 0 reponse,
+  // "Süper Lig" seul => 4 reponses dont la bonne) -- le moteur de
+  // recherche d'API-Football ne tolere pas ce suffixe compose. On envoie
+  // desormais uniquement la partie avant le tiret cadratin (ou le tiret
+  // simple/double en repli) a la recherche ; countryHint (deja en place
+  // ci-dessus) se charge ensuite de departager les homonymes que ce nom
+  // nettoye peut faire remonter (ex. "Süper Lig" existe aussi en Serbie,
+  // Moldavie, Slovaquie).
+  const searchName = leagueName.split(/[—–-]/)[0].trim() || leagueName;
+  const res = await apiFootballGet(env, "/leagues", { search: searchName });
   if (!res || !res.length) throw new Error("championnat introuvable: " + leagueName);
 
   // La recherche peut renvoyer plusieurs entrées proches (ex. "Liga MX"
   // ET "Liga MX Femenil"). On priorise : nom exact > type "League"
-  // (pas Cup) > présence de la saison demandée.
+  // (pas Cup) > présence de la saison demandée > pays attendu — le champ
+  // "Pays" tape par l'utilisateur prime sur la table statique de repli.
   const n = norm(leagueName);
+  const effectiveCountryHint = chRaw || LEAGUE_COUNTRY_HINTS[n];
   const score = r => {
     let s = 0;
     if (norm(r.league.name) === n) s += 100;
     if (r.league.type === "League") s += 10;
     if ((r.seasons || []).some(x => String(x.year) === String(season))) s += 1;
+    if (effectiveCountryHint && norm(r.country?.name || "") === norm(effectiveCountryHint)) s += 50;
     return s;
   };
   const entry = res.slice().sort((a, b) => score(b) - score(a))[0];
@@ -744,14 +853,85 @@ async function resolveTeam(env, teamName, leagueId, season) {
   // de nom. Sans cette vérification, un nom ambigu (ex. "Tigres" existe
   // dans plusieurs pays) peut faire remonter une équipe qui n'a joué aucun
   // match dans le bon championnat — stats à 0.00 partout, value faussée.
-  const res = await apiFootballGet(env, "/teams", { search: teamName });
+  let res = await apiFootballGet(env, "/teams", { search: teamName });
+  if ((!res || !res.length) && TEAM_SEARCH_ALIASES) {
+    // Ajoute le 07/09/2026 -- certains clubs portent, dans l'usage courant,
+    // un nom qui ne partage RIEN avec leur nom officiel API-Football ("CD
+    // Tolima" vs "Deportes Tolima" -- confirme en direct sur Llaneros vs CD
+    // Tolima, Colombie : la recherche initiale ne renvoie ZERO resultat,
+    // pas juste le mauvais championnat, donc le retry premier-mot plus bas
+    // dans cette fonction n'est jamais atteint). Contrairement a
+    // TEAM_NAME_ALIASES (comparaison de texte normalise, utilisee pour le
+    // matching des cotes), cette table sert de terme de recherche a
+    // proprement envoyer a l'API -- d'ou une table separee, avec des
+    // valeurs qui restent lisibles (espaces conserves).
+    const nTeam = norm(teamName);
+    const aliasKey = Object.keys(TEAM_SEARCH_ALIASES).find(k => nTeam.includes(k) || k.includes(nTeam));
+    if (aliasKey) {
+      try {
+        const res2 = await apiFootballGet(env, "/teams", { search: TEAM_SEARCH_ALIASES[aliasKey] });
+        if (res2 && res2.length) res = res2;
+      } catch (errAlias) {
+        // best-effort : si cet essai echoue aussi, on retombe sur le
+        // message d'erreur habituel juste en dessous.
+      }
+    }
+  }
   if (!res || !res.length) throw new Error("équipe introuvable: " + teamName);
 
   let candidates = res;
   try {
     const validIds = await getLeagueTeamIds(env, leagueId, season);
     if (validIds.size) {
-      const inLeague = res.filter(r => validIds.has(r.team.id));
+      let inLeague = res.filter(r => validIds.has(r.team.id));
+      // Ajoute le 07/09/2026 -- certains clubs sont enregistres cote
+      // API-Football sous une abreviation qui ne partage aucun mot complet
+      // avec le nom usuel ("Argentinos JRS" vs "Argentinos Juniors" -- leur
+      // moteur de recherche ne fait aucun rapprochement flou entre "JRS" et
+      // "Juniors", confirme en direct : chercher le nom complet ne
+      // remontait que l'equipe reserve, jamais l'equipe premiere). Avant de
+      // conclure a un homonyme, on retente avec le PREMIER mot seul du nom
+      // tape, qui suffit generalement a retrouver le club meme quand le
+      // reste du nom differe -- best-effort, jamais pire que l'ancien
+      // comportement si ca ne trouve rien de plus.
+      if (!inLeague.length) {
+        const firstWord = teamName.trim().split(/\s+/)[0];
+        if (firstWord && firstWord.length >= 4 && norm(firstWord) !== norm(teamName)) {
+          try {
+            const res2 = await apiFootballGet(env, "/teams", { search: firstWord });
+            if (res2 && res2.length) {
+              inLeague = res2.filter(r => validIds.has(r.team.id));
+            }
+          } catch (err2) {
+            // best-effort : si ce second essai echoue, on retombe sur le
+            // message d'ambiguite habituel juste en dessous.
+          }
+        }
+      }
+      // Ajoute le 12/09/2026 -- troisieme tentative via TEAM_SEARCH_ALIASES,
+      // pour le cas ou la recherche initiale renvoie bien des resultats
+      // (contrairement a Tolima) mais AUCUN dans la bonne ligue -- typique
+      // d'un club dont l'equipe premiere est enregistree sous un nom sans
+      // aucun rapport avec le nom d'usage (ex. "Guimaraes" -> equipes B/
+      // U23/U19/feminine seulement, l'equipe premiere est "Vitoria SC").
+      // Le premier essai (recherche vide) et celui-ci (recherche non vide
+      // mais mauvaise ligue) sont deux echecs differents, tous deux geres
+      // par la meme table d'alias.
+      if (!inLeague.length) {
+        const nTeam2 = norm(teamName);
+        const aliasKey2 = Object.keys(TEAM_SEARCH_ALIASES).find(k => nTeam2.includes(k) || k.includes(nTeam2));
+        if (aliasKey2) {
+          try {
+            const res3 = await apiFootballGet(env, "/teams", { search: TEAM_SEARCH_ALIASES[aliasKey2] });
+            if (res3 && res3.length) {
+              inLeague = res3.filter(r => validIds.has(r.team.id));
+            }
+          } catch (err3) {
+            // best-effort : si ce troisieme essai echoue, on retombe sur le
+            // message d'ambiguite habituel juste en dessous.
+          }
+        }
+      }
       if (!inLeague.length) {
         throw new Error("'" + teamName + "' introuvable dans cette ligue/saison — " +
           "nom probablement ambigu (un homonyme existe dans un autre pays). " +
@@ -1259,18 +1439,42 @@ function decodeUnderstatVar(html, varName) {
 /* =====================================================
    THE ODDS API (inchangé)
    ===================================================== */
-async function resolveSportKey(env, leagueName) {
-  // Cache long (30 jours), même logique que resolveLeague : la correspondance
-  // championnat → clé "sport" de The Odds API ne change quasiment jamais,
-  // pas besoin de refaire cet appel à chaque recherche.
-  const cacheKey = "sportkey:" + norm(leagueName);
+// Ajoute le 07/09/2026 -- plutot que de continuer a ajouter un alias par
+// collision decouverte au fil de l'eau (Turquie/Danemark, Italie/Bresil
+// ce soir), on utilise desormais le champ "Pays" deja rempli par
+// l'utilisateur (fsCountry) comme departage generique : quand plusieurs
+// championnats correspondent au nom tape, on prefere celui dont le titre
+// The Odds API contient le pays indique. Les alias statiques restent en
+// filet de securite pour les cas ou le champ Pays est laisse vide, ou pour
+// les noms qui ne partagent aucun mot avec leur titre officiel (EPL...).
+async function resolveSportKey(env, leagueName, countryHint) {
+  // Cache long (30 jours), même logique que resolveLeague. La cle inclut
+  // desormais le pays indice : "Serie B" + "Italy" et "Serie B" sans pays
+  // ne doivent pas partager la meme entree de cache, sous peine de servir
+  // une resolution figee sur le premier pays demande par n'importe quel
+  // utilisateur.
+  const ch = norm(countryHint || "");
+  const cacheKey = "sportkey:" + norm(leagueName) + ":" + ch;
   const cached = await cacheGet(env, cacheKey);
   if (cached) return cached;
 
   const res = await fetchT("https://api.the-odds-api.com/v4/sports?apiKey=" + env.ODDS_API_KEY);
   if (!res.ok) throw new Error("HTTP " + res.status + " (liste des sports) — clé longueur=" + (env.ODDS_API_KEY || "").length);
   const list = await res.json();
-  const n = norm(leagueName);
+  // Correctif du 07/09/2026 (bis) -- le champ Championnat de l'app peut
+  // afficher le nom SEUL ("Süper Lig") ou SUIVI du pays ("Süper Lig —
+  // Turkey") selon le chemin emprunte pour le remplir (selection directe
+  // vs lien "changer"). L'alias precedent etait code en dur sur le format
+  // avec pays colle ("superligturkey"), donc des que l'utilisateur voit le
+  // champ sans le pays, l'alias ne matchait plus DU TOUT et "Süper Lig"
+  // retombait sur l'ancien bug de collision avec le Danemark (confirme en
+  // direct : Besiktas vs Erzurumspor, "Süper Lig" seul → introuvable, alors
+  // que "Süper Lig — Turkey" fonctionnait). On nettoie desormais le nom
+  // (tout ce qui suit un tiret) AVANT de calculer n, pour que les deux
+  // formats du champ produisent la meme cle -- alignes sur le meme
+  // nettoyage deja applique cote API-Football dans resolveLeague.
+  const baseLeagueName = leagueName.split(/[—–-]/)[0].trim() || leagueName;
+  const n = norm(baseLeagueName);
   // Alias : certains championnats ont un titre The Odds API qui ne partage
   // aucun mot avec le nom API-Football. Ex. "Premier League" cote "EPL" —
   // aucune inclusion mutuelle possible. On force la cle dans ces cas.
@@ -1281,13 +1485,60 @@ async function resolveSportKey(env, leagueName) {
     "bundesliga": "soccer_germany_bundesliga",
     "ligue1": "soccer_france_ligue_one",
     "primeiraliga": "soccer_portugal_primeira_liga",
-    "eredivisie": "soccer_netherlands_eredivisie"
+    "eredivisie": "soccer_netherlands_eredivisie",
+    "superlig": "soccer_turkey_super_league",
+    "serieb": "soccer_italy_serie_b",
+    "ligaprofesional": "soccer_argentina_primera_division",
+    // Ajoute le 11/09/2026 -- "K League 1" (Coree du Sud) contient
+    // litteralement "league1" comme sous-chaine une fois normalise
+    // ("kleague1"), collision avec "League 1" (Angleterre, "league1").
+    // Contrairement aux collisions precedentes (Turquie/Danemark,
+    // Italie/Bresil), countryHint ne peut PAS departager ce cas : le
+    // titre officiel "K League 1" ne mentionne "Korea" nulle part dans
+    // son propre texte -- confirme en direct sur Bucheon FC 1995 vs Jeju
+    // United FC.
+    "kleague1": "soccer_korea_kleague1"
   };
-  if (ALIAS[n]) {
-    const forced = list.find(s => s.key === ALIAS[n]);
+  // Correctif du 07/09/2026 -- la premiere version de ce patch desactivait
+  // l'alias des qu'un pays etait fourni, en partant du principe que le
+  // countryHint suffirait. Faux : le champ Championnat de l'app inclut
+  // deja le pays dans son propre texte ("Sueper Lig -- Turkey"), donc une
+  // fois normalise il ne matche plus AUCUN titre The Odds API par simple
+  // inclusion -- sans l'alias pour rattraper ce cas, plus rien ne
+  // fonctionnait (confirme en direct sur Besiktas vs Erzurumspor, qui
+  // marchait avant ce soir). L'alias reste donc verifie inconditionnellement
+  // en premier ; le countryHint ne sert qu'a departager les cas que
+  // l'alias ne couvre pas encore.
+  // Correctif du 07/09/2026 (ter) -- meme cause que les deux precedents
+  // correctifs ce soir, une troisieme fois : le nom de base peut lui-meme
+  // deja contenir le pays ("Liga Profesional Argentina", nom officiel API-
+  // Football), donc une cle d'alias exacte ("ligaprofesional") ne matche
+  // plus des que l'autocomplete choisit ce nom complet plutot que la
+  // version courte. Plutot que de rajouter une cle par variante de texte a
+  // chaque nouvelle collision (ce qui ne finira jamais), la recherche
+  // d'alias tolere desormais l'inclusion dans les deux sens, comme le reste
+  // de la logique de matching de ce fichier.
+  const aliasKey = ALIAS[n] ? n : Object.keys(ALIAS).find(k => n.includes(k) || k.includes(n));
+  if (aliasKey) {
+    const forced = list.find(s => s.key === ALIAS[aliasKey]);
     if (forced) { await cacheSet(env, cacheKey, forced.key, 2592000); return forced.key; }
   }
-  const match = list.find(s => s.group === "Soccer" && (norm(s.title).includes(n) || n.includes(norm(s.title))));
+  const candidates = list.filter(s => s.group === "Soccer" && (norm(s.title).includes(n) || n.includes(norm(s.title))));
+  let match = null;
+  if (candidates.length) {
+    // Ajoute le 12/09/2026 -- countryHint echouait sur "Switzerland" vs
+    // "Swiss Superleague" : le titre officiel utilise le demonyme (l'
+    // adjectif national), pas le nom du pays tel que tape dans le champ
+    // Pays -- confirme en direct sur FC Lugano vs BSC Young Boys, ou les
+    // 4 candidats "Super League" (Chine/Grece/Suisse/Turquie) ne
+    // pouvaient etre departages puisque aucun ne contenait "switzerland".
+    // Table volontairement minimale : etendue au fil des cas rencontres,
+    // pas une liste exhaustive de tous les demonymes du monde.
+    const DEMONYMS = { switzerland: "swiss", england: "english", netherlands: "dutch", france: "french", germany: "german", spain: "spanish", italy: "italian", scotland: "scottish", wales: "welsh" };
+    const chAlt = DEMONYMS[ch] || null;
+    if (ch) match = candidates.find(s => { const t = norm(s.title); return t.includes(ch) || (chAlt && t.includes(chAlt)); }) || null;
+    if (!match) match = (ALIAS[n] && candidates.find(s => s.key === ALIAS[n])) || candidates[0];
+  }
   if (!match) throw new Error("championnat introuvable: " + leagueName);
   await cacheSet(env, cacheKey, match.key, 2592000); // 30 jours
   return match.key;
@@ -1359,12 +1610,112 @@ async function fetchOddsEvents(env, sportKey, markets) {
 // Comparaison de noms d'équipe robuste : égalité, inclusion dans un sens ou
 // l'autre, puis en dernier recours un préfixe commun de 5 caractères (utile
 // pour des variantes proches comme "Botafogo" vs "Botafogo RJ").
+// Corrige le 07/09/2026 -- certains clubs ont un nom court qui n'est PAS
+// un prefixe de leur nom complet, contrairement a la quasi-totalite des
+// clubs francais (Lens/RC Lens, Nice/OGC Nice...). "Rennes" vs "Stade
+// RENNAIS FC" est le premier cas trouve (forme adjectivale, pas un
+// prefixe) -- confirme en direct : Angers vs Rennes introuvable chez
+// OddsPapi malgre l'existence reelle du match. Petite liste d'alias
+// explicites, extensible si d'autres cas similaires apparaissent,
+// plutot qu'un algorithme flou plus risque en faux positifs.
+const TEAM_NAME_ALIASES = {
+  "rennes": ["rennais"],
+  // Ajoute le 07/09/2026 -- effet de bord du correctif TEAM_SEARCH_ALIASES
+  // juste en dessous : une fois les stats corrigees, le champ affiche
+  // "Deportes Tolima" (nom officiel API-Football), mais OddsPapi connait ce
+  // club sous "CD Tolima" (confirme dans leur flux fixtures) -- deux SOURCES
+  // DIFFERENTES avec des conventions de nom differentes pour le meme club.
+  // teamNameMatches() (utilisee pour le matching des cotes, The Odds API et
+  // OddsPapi) a besoin de son propre alias, independant de celui de
+  // resolveTeam ci-dessous qui ne sert qu'a la recherche API-Football.
+  "tolima": ["cdtolima"],
+  // Ajoute le 12/09/2026 -- "QPR" (3 lettres, sigle usuel) ne partage pas
+  // assez de caracteres consecutifs avec "Queens Park Rangers" (nom
+  // officiel The Odds API) pour matcher via le test des 5 premiers
+  // caracteres -- confirme en direct sur West Brom vs QPR.
+  "qpr": ["queensparkrangers"],
+  // Ajoute le 12/09/2026 -- "Turku PS" vs "TPS Turku" (The Odds API) n'est
+  // pas juste un ordre de mots inverse : "TPS" est un seul token chez The
+  // Odds API, mais "Turku PS" se decoupe en "turku"+"ps" cote saisie
+  // utilisateur -- deux ensembles de mots differents, que le tri ajoute
+  // juste avant ne peut pas reconcilier. Alias direct sur les deux formes
+  // completes plutot que sur un mot isole.
+  "turkups": ["tpsturku", "turunpalloseura"],
+  // Ajoute le 12/09/2026 -- OddsPapi utilise "Young Boys Bern" plutot que
+  // "BSC Young Boys" -- confirme en direct sur FC Lugano vs BSC Young Boys.
+  "youngboys": ["youngboysbern"],
+  // Ajoute le 12/09/2026 -- meme cas que Tolima (07/09) : une fois les
+  // stats corrigees via TEAM_SEARCH_ALIASES, le champ affichera "Vitoria
+  // SC" (nom officiel API-Football/The Odds API), qui ne partage pas
+  // assez de caracteres avec "Guimaraes" (nom d'usage) pour matcher --
+  // ajoute ici PREVENTIVEMENT, avant que le meme effet de bord ne se
+  // reproduise comme pour Tolima ce soir.
+  "guimaraes": ["vitoriasc"],
+};
+// Voir usage detaille dans resolveTeam ci-dessus : terme de recherche
+// alternatif a envoyer a l'API-Football quand la recherche du nom tel que
+// saisi ne renvoie strictement aucun resultat (pas juste le mauvais
+// championnat -- ce cas est deja gere par le retry premier-mot).
+const TEAM_SEARCH_ALIASES = {
+  "tolima": "Deportes Tolima",
+  // Ajoute le 12/09/2026 -- "Guimaraes" (nom d'usage) ne renvoie chez
+  // API-Football que les equipes B/U23/U19/feminine -- l'equipe premiere
+  // est enregistree sous "Vitoria SC", sans "Guimaraes" dans son nom
+  // officiel du tout. Cle sur "guimaraes" pour couvrir aussi bien
+  // "Guimaraes" seul que "Vitoria Guimaraes" (na.includes(key) suffit).
+  "guimaraes": "Vitoria SC",
+  // Ajoute le 12/09/2026 -- nom officiel API-Football "Academico Viseu"
+  // (sans "de"), alors que le nom d'usage courant est "Academico de
+  // Viseu" -- le "de" au milieu casse l'inclusion simple des deux cotes.
+  "academicodeviseu": "Academico Viseu",
+  // Ajoute le 12/09/2026 -- The Odds API (et l'app, si le champ a ete
+  // rempli en suivant ce nom) utilise "Jeonbuk Hyundai Motors", mais
+  // API-Football connait ce club sous "Jeonbuk Motors" (sans Hyundai) --
+  // confirme en direct via getMatchResult (reglement automatique du
+  // journal), K League 1, Jeonbuk vs FC Seoul.
+  "jeonbukhyundaimotors": "Jeonbuk Motors",
+};
+// Ajoute le 07/09/2026 -- des mots de liaison ou sigles de forme juridique
+// dans le nom d'un club (ex. "RC Celta DE Vigo" chez OddsPapi vs "Celta
+// Vigo" tel que saisi) s'intercalent entre les mots significatifs. Comme
+// norm() colle tout en une seule chaine sans espaces, "rccetladevigo"
+// (mot "de" au milieu) ne matche jamais "celtavigo" via includes(), meme
+// si les DEUX noms designent le meme club -- confirme en direct sur
+// Getafe vs Celta Vigo (secours OddsPapi en erreur alors que le match
+// existait bien). On compare ici mot par mot, apres avoir retire les
+// petits mots de liaison et sigles de forme juridique les plus courants
+// en Europe -- PAS "ca" pour l'instant (trop ambigu avec les clubs
+// argentins "Club Atletico ..." -- a traiter separement si l'app s'etend
+// vers l'Amerique du Sud).
+const TEAM_NAME_STOPWORDS = new Set(["de", "del", "of", "the", "van", "der", "fc", "cf", "cd", "ac", "rc", "sc", "ud"]);
+function teamNameTokensMatch(a, b) {
+  const wordsA = (a || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .split(/[^a-z0-9]+/).filter(w => w && !TEAM_NAME_STOPWORDS.has(w));
+  const wordsB = (b || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .split(/[^a-z0-9]+/).filter(w => w && !TEAM_NAME_STOPWORDS.has(w));
+  if (!wordsA.length || !wordsB.length) return false;
+  // Ajoute le 12/09/2026 -- certaines sources inversent l'ordre des mots
+  // d'un meme club ("Turku PS" vs "TPS Turku" chez The Odds API) -- ni
+  // l'inclusion simple ni la comparaison dans l'ordre tape ne matchaient.
+  // Trier les mots avant de comparer rend ce test insensible a l'ordre,
+  // sans avoir besoin d'un alias par cas rencontre.
+  return wordsA.slice().sort().join("") === wordsB.slice().sort().join("");
+}
 function teamNameMatches(a, b) {
   const na = norm(a), nb = norm(b);
   if (!na || !nb) return false;
   if (na === nb || na.includes(nb) || nb.includes(na)) return true;
   const minLen = Math.min(na.length, nb.length);
-  return minLen >= 5 && na.slice(0, 5) === nb.slice(0, 5);
+  if (minLen >= 5 && na.slice(0, 5) === nb.slice(0, 5)) return true;
+  if (teamNameTokensMatch(a, b)) return true;
+  for (const key in TEAM_NAME_ALIASES) {
+    const aliases = TEAM_NAME_ALIASES[key];
+    const naHasKey = na.includes(key), nbHasKey = nb.includes(key);
+    const naHasAlias = aliases.some(al => na.includes(al));
+    const nbHasAlias = aliases.some(al => nb.includes(al));
+    if ((naHasKey && nbHasAlias) || (nbHasKey && naHasAlias)) return true;
+  }
+  return false;
 }
 
 // Ajouté le 15/08/2026 — secours OddsPapi, UNIQUEMENT quand The Odds API +
@@ -1389,6 +1740,16 @@ const ODDSPAPI_TRUSTED_BOOKS = [
   "williamhill", "betfair", "marathonbet", "1xbet", "betsson",
 ];
 
+// Ajoute le 06/09/2026 -- OddsPapi renvoie parfois un slug de bookmaker
+// avec un suffixe (ex. "pinnacle+30" au lieu de "pinnacle", confirme en
+// direct sur Everton vs Manchester United) -- une egalite stricte
+// rejetait alors ce book en silence malgre des donnees parfaitement
+// valides. On verifie desormais si le slug COMMENCE PAR un nom de
+// confiance plutot qu'une correspondance exacte.
+function isTrustedOddsPapiBook(bookSlug) {
+  return ODDSPAPI_TRUSTED_BOOKS.some(trusted => bookSlug.startsWith(trusted));
+}
+
 const COMPETS_PARASITES = /\b(srl|simulated|women|femin|u1[6-9]|u2[0-3]|youth|reserve|esport|cyber)\b/i;
 function oddsPapiFixturePropre(matches) {
   const propres = matches.filter(f => {
@@ -1410,7 +1771,7 @@ function oddsPapiFixturePropre(matches) {
   return propres[0];
 }
 
-async function fetchOddsPapiTotalsFallback(env, homeName, awayName) {
+async function fetchOddsPapiFallback(env, homeName, awayName) {
   if (!env.ODDSPAPI_API_KEY) throw new Error("ODDSPAPI_API_KEY absente de l'environnement serveur");
   const base = "https://api.oddspapi.io/v4";
   const today = new Date().toISOString().slice(0, 10);
@@ -1423,16 +1784,6 @@ async function fetchOddsPapiTotalsFallback(env, homeName, awayName) {
   const fixtures = await fixturesRes.json();
   const matches = fixtures.filter(f => teamNameMatches(f.participant1Name, homeName) && teamNameMatches(f.participant2Name, awayName));
   if (!matches.length) throw new Error("OddsPapi : match \"" + homeName + "\" vs \"" + awayName + "\" introuvable parmi " + fixtures.length + " matchs (9 prochains jours)");
-  // Round 39-bis : un même match peut apparaître en double avec un statut
-  // "Live" erroné même des heures avant le coup d'envoi (bug constaté ce
-  // soir sur Alaves-Getafe) — on préfère systématiquement un doublon non
-  // marqué "Live" quand il en existe un.
-  // Corrige le 15/08/2026 : un doublon "Finished" (match deja termine, dans
-  // une autre saison ou compet.) passait ce filtre puisqu'il n'etait pas
-  // "Live" -- et s'il apparait en premier dans la liste (constate sur
-  // Alaves-Getafe), c'est LUI qui etait choisi au lieu du vrai match a
-  // venir, avec des cotes forcement vides ou perimees. On exclut desormais
-  // aussi "Finished".
   const fixture = oddsPapiFixturePropre(matches);
 
   const oddsRes = await fetchT(`${base}/odds?apiKey=${env.ODDSPAPI_API_KEY}&fixtureId=${fixture.fixtureId}`);
@@ -1441,36 +1792,22 @@ async function fetchOddsPapiTotalsFallback(env, homeName, awayName) {
     throw new Error("OddsPapi odds HTTP " + oddsRes.status + " (fixture " + fixture.statusName + ") — " + body.slice(0, 150));
   }
   const odds = await oddsRes.json();
-  // Ajoute le 15/08/2026 : OddsPapi peut repondre HTTP 200 avec un corps
-  // {"error": {...}} (ex. rate limit) au lieu d'un vrai HTTP d'erreur.
-  // L'ancien code ne verifiait jamais ce champ et lisait silencieusement
-  // "bookmakerOdds: {}" -- indiscernable d'un vrai marche absent. On leve
-  // maintenant une vraie erreur explicite dans ce cas.
   if (odds.error) {
     throw new Error("OddsPapi erreur: " + (odds.error.message || JSON.stringify(odds.error)));
   }
   const bookmakerOdds = odds.bookmakerOdds || {};
-  const out = { oO25: [], oU25: [], oO15: [], oU15: [] };
-  // Corrige le 15/08/2026 -- 1012/1013 correspondait en realite a la ligne
-  // 3,5 buts chez OddsPapi (verifie via GET /v4/markets en direct), pas a
-  // la ligne 1,5 comme suppose depuis le pattern de 2,5 (1010/1011). Les
-  // vrais IDs pour Over/Under 1.5 buts sont 108 (Over) / 109 (Under) --
-  // une numerotation totalement differente, propre a cette ligne chez ce
-  // fournisseur, pas devinable depuis le pattern des autres lignes.
-  const marketMap = { "1010": "oO25", "1011": "oU25", "108": "oO15", "109": "oU15" };
-  // Corrige le 15/08/2026 : OddsPapi imbrique Over ET Under sous le MEME
-  // marche top-niveau (ex. le marche "1012" contient les deux outcomes
-  // "1012" (Over) et "1013" (Under)). L'ancienne version cherchait
-  // markets[marketId] pour chaque cle du marketMap independamment -- ca
-  // fusionnait Over et Under dans le meme panier (doublait les prix, d'ou
-  // des compteurs "X books" absurdes vus en prod, ex. 326) et laissait
-  // Under quasiment toujours vide (son ID n'existe jamais comme cle
-  // top-niveau de "markets", seulement imbrique dans les outcomes du
-  // marche Over correspondant). On boucle desormais sur TOUS les marches
-  // reellement presents, et c'est la cle de l'OUTCOME (pas celle du
-  // marche parent) qui determine le panier de destination.
+  const out = { oO25: [], oU25: [], oO15: [], oU15: [], oBTTSyes: [], oBTTSno: [] };
+  // Fusion du 07/09/2026 -- totaux (1010/1011 pour 2,5 ; 108/109 pour 1,5)
+  // et BTTS (104/105) sont deux marches distincts chez OddsPapi mais la
+  // MEME reponse /odds les contient deja tous les deux. Un seul appel
+  // fixtures+odds au lieu de deux (un par ancien fallback separe) elimine
+  // la collision de rate-limit constatee en prod (Everton vs Man United,
+  // Elche vs Real Sociedad : le 2e appel OddsPapi coup sur coup se
+  // faisait rejeter par RATE_LIMITED) et divise par deux la consommation
+  // de quota quand les deux marches manquent en meme temps.
+  const marketMap = { "1010": "oO25", "1011": "oU25", "108": "oO15", "109": "oU15", "104": "oBTTSyes", "105": "oBTTSno" };
   Object.entries(bookmakerOdds).forEach(([bookSlug, bookData]) => {
-    if (!ODDSPAPI_TRUSTED_BOOKS.includes(bookSlug)) return;
+    if (!isTrustedOddsPapiBook(bookSlug)) return;
     const markets = bookData?.markets || {};
     Object.values(markets).forEach(market => {
       if (!market) return;
@@ -1483,11 +1820,20 @@ async function fetchOddsPapiTotalsFallback(env, homeName, awayName) {
       });
     });
   });
-  const hasAny = out.oO25.length || out.oU25.length || out.oO15.length || out.oU15.length;
+  const hasAny = out.oO25.length || out.oU25.length || out.oO15.length || out.oU15.length || out.oBTTSyes.length || out.oBTTSno.length;
   return hasAny ? out : null;
 }
 
-async function fetchOddsPapiBttsFallback(env, homeName, awayName) {
+// Ajoute le 07/09/2026 -- certains championnats (ex. Colombie, Paraguay)
+// n'ont AUCUNE entree chez The Odds API, meme approximative : resolveSportKey
+// echoue avant meme d'atteindre getOdds(), donc le secours OddsPapi habituel
+// (qui ne comble que les trous PARTIELS -- totaux/BTTS manquants -- une fois
+// que The Odds API a deja reussi le 1N2) n'est jamais atteint. Ces deux
+// fonctions forment un chemin de secours COMPLET, uniquement pour ce cas :
+// tout, y compris le 1N2, vient d'OddsPapi. Fonctions volontairement
+// separees de fetchOddsPapiFallback/getOdds existantes (jamais modifiees)
+// pour ne prendre aucun risque sur les championnats qui fonctionnent deja.
+async function fetchOddsPapiFull(env, homeName, awayName) {
   if (!env.ODDSPAPI_API_KEY) throw new Error("ODDSPAPI_API_KEY absente de l'environnement serveur");
   const base = "https://api.oddspapi.io/v4";
   const today = new Date().toISOString().slice(0, 10);
@@ -1495,33 +1841,31 @@ async function fetchOddsPapiBttsFallback(env, homeName, awayName) {
   const fixturesRes = await fetchT(`${base}/fixtures?apiKey=${env.ODDSPAPI_API_KEY}&sportId=10&from=${today}&to=${in9days}`);
   if (!fixturesRes.ok) {
     const body = await fixturesRes.text().catch(() => "");
-    throw new Error("OddsPapi fixtures HTTP " + fixturesRes.status + " -- " + body.slice(0, 150));
+    throw new Error("OddsPapi fixtures HTTP " + fixturesRes.status + " — " + body.slice(0, 150));
   }
   const fixtures = await fixturesRes.json();
   const matches = fixtures.filter(f => teamNameMatches(f.participant1Name, homeName) && teamNameMatches(f.participant2Name, awayName));
   if (!matches.length) throw new Error("OddsPapi : match \"" + homeName + "\" vs \"" + awayName + "\" introuvable parmi " + fixtures.length + " matchs (9 prochains jours)");
-  // Même filtre Live/Finished que fetchOddsPapiTotalsFallback (voir
-  // Round 39-bis / correctif du 15/08/2026 ci-dessus pour le raisonnement).
   const fixture = oddsPapiFixturePropre(matches);
 
   const oddsRes = await fetchT(`${base}/odds?apiKey=${env.ODDSPAPI_API_KEY}&fixtureId=${fixture.fixtureId}`);
   if (!oddsRes.ok) {
     const body = await oddsRes.text().catch(() => "");
-    throw new Error("OddsPapi odds HTTP " + oddsRes.status + " (fixture " + fixture.statusName + ") -- " + body.slice(0, 150));
+    throw new Error("OddsPapi odds HTTP " + oddsRes.status + " (fixture " + fixture.statusName + ") — " + body.slice(0, 150));
   }
   const odds = await oddsRes.json();
   if (odds.error) {
     throw new Error("OddsPapi erreur: " + (odds.error.message || JSON.stringify(odds.error)));
   }
   const bookmakerOdds = odds.bookmakerOdds || {};
-  const out = { oBTTSyes: [], oBTTSno: [] };
-  // Marché "Both Teams To Score" = marketId 104 chez OddsPapi (doc
-  // officielle GET /v4/markets) -- outcomeId 104 = "Yes", 105 = "No".
-  // Même logique d'indexation par outcomeId (pas par marché parent) que
-  // pour Over/Under -- voir le correctif du 15/08/2026 ci-dessus.
-  const marketMap = { "104": "oBTTSyes", "105": "oBTTSno" };
+  const out = { o1: [], oX: [], o2: [], oO25: [], oU25: [], oO15: [], oU15: [], oBTTSyes: [], oBTTSno: [] };
+  // 101/102/103 = marche "moneyline" (1N2) chez OddsPapi -- confirme via
+  // bookmakerOutcomeId explicite ("home"/"draw"/"away") sur un fixture
+  // colombien reel le 07/09/2026, en plus des marches deja connus
+  // (totaux 1010/1011/108/109, BTTS 104/105).
+  const marketMap = { "101": "o1", "102": "oX", "103": "o2", "1010": "oO25", "1011": "oU25", "108": "oO15", "109": "oU15", "104": "oBTTSyes", "105": "oBTTSno" };
   Object.entries(bookmakerOdds).forEach(([bookSlug, bookData]) => {
-    if (!ODDSPAPI_TRUSTED_BOOKS.includes(bookSlug)) return;
+    if (!isTrustedOddsPapiBook(bookSlug)) return;
     const markets = bookData?.markets || {};
     Object.values(markets).forEach(market => {
       if (!market) return;
@@ -1534,8 +1878,41 @@ async function fetchOddsPapiBttsFallback(env, homeName, awayName) {
       });
     });
   });
-  const hasAny = out.oBTTSyes.length || out.oBTTSno.length;
-  return hasAny ? out : null;
+  const hasAny = Object.values(out).some(arr => arr.length);
+  if (!hasAny) throw new Error("OddsPapi : fixture trouve mais aucune cote exploitable");
+  return out;
+}
+
+async function getOddsFromOddsPapiOnly(env, homeName, awayName) {
+  const collect = await fetchOddsPapiFull(env, homeName, awayName);
+  // Selection simplifiee (pas de priorite Betclic/Winamax ici -- ces books
+  // ne couvrent de toute facon jamais ces championnats, inutile de le
+  // verifier a chaque marche) : meilleure cote dispo, avec le meme filtre
+  // anti-aberration (mediane x3) que le reste de l'app.
+  const out = { spread: {}, bestBook: {} };
+  Object.keys(collect).forEach(k => {
+    let arr = collect[k];
+    if (!arr.length) { out[k] = null; out.bestBook[k] = null; out.spread[k] = null; return; }
+    if (arr.length >= 3) {
+      const sortedPrices = arr.map(p => p.price).slice().sort((a, b) => a - b);
+      const mid = Math.floor(sortedPrices.length / 2);
+      const median = sortedPrices.length % 2 ? sortedPrices[mid] : (sortedPrices[mid - 1] + sortedPrices[mid]) / 2;
+      const kept = arr.filter(p => p.price <= median * 3 && p.price >= median / 3);
+      if (kept.length) arr = kept;
+    }
+    let best = arr[0], min = arr[0].price, max = arr[0].price;
+    arr.forEach(p => {
+      if (p.price > best.price) best = p;
+      if (p.price < min) min = p.price;
+      if (p.price > max) max = p.price;
+    });
+    out[k] = best.price;
+    out.bestBook[k] = best.book;
+    out.spread[k] = { spread: max - min, count: arr.length };
+  });
+  out.pinnacle = null;
+  out.warning = "championnat non couvert par The Odds API -- toutes les cotes proviennent d'OddsPapi (aucune chez Betclic/Winamax/PMU) -- verifie le book avant de jouer";
+  return out;
 }
 
 async function getOdds(env, sportKey, homeName, awayName) {
@@ -1641,51 +2018,57 @@ async function getOdds(env, sportKey, homeName, awayName) {
       });
     });
   });
-  const noTotalsAtAll = !collect.oO25.length && !collect.oU25.length && !collect.oO15.length && !collect.oU15.length;
-  if (noTotalsAtAll) {
-    const originalIssue = totalsWarning; // conserve la raison d'origine si "h2h,totals" avait déjà échoué
-    // Secours OddsPapi — voir fetchOddsPapiTotalsFallback ci-dessus pour le
-    // raisonnement complet. Jamais fatal : si ça échoue pour n'importe
-    // quelle raison, on retombe simplement sur le comportement d'avant
-    // (avertissement informatif, pas de totaux).
+    // Fusion du 07/09/2026 -- un seul appel OddsPapi (fixtures+odds) au lieu
+  // de deux appels separes (un par ancien fallback), pour eliminer la
+  // collision de rate-limit constatee en prod (Everton vs Man United,
+  // Elche vs Real Sociedad).
+  const totalsMissing = { oO25: !collect.oO25.length, oU25: !collect.oU25.length, oO15: !collect.oO15.length, oU15: !collect.oU15.length };
+  const noTotalsAtAll = totalsMissing.oO25 || totalsMissing.oU25 || totalsMissing.oO15 || totalsMissing.oU15;
+  const noBttsAtAll = !collect.oBTTSyes.length && !collect.oBTTSno.length;
+  if (noTotalsAtAll || noBttsAtAll) {
+    const originalIssue = totalsWarning;
     let fallback = null;
     let fallbackErr = null;
-    try { fallback = await fetchOddsPapiTotalsFallback(env, homeName, awayName); } catch (e) { fallbackErr = e.message; }
+    try { fallback = await fetchOddsPapiFallback(env, homeName, awayName); } catch (e) { fallbackErr = e.message; }
+    let filledTotals = 0, filledBtts = 0;
     if (fallback) {
-      collect.oO25 = fallback.oO25; collect.oU25 = fallback.oU25;
-      collect.oO15 = fallback.oO15; collect.oU15 = fallback.oU15;
-      totalsWarning = "totals absents chez Winamax/Unibet/Betclic — complétés via OddsPapi (secours, " +
-        (fallback.oO25.length + fallback.oU25.length + fallback.oO15.length + fallback.oU15.length) + " cotes trouvées)";
-    } else {
-      const detail = Object.keys(marketsSeenPerBook).length
-        ? Object.entries(marketsSeenPerBook).map(([book, mks]) => book + " : " + mks).join(" · ")
-        : "aucun bookmaker demandé n'a répondu pour ce match";
-      totalsWarning = (originalIssue ? originalIssue + " · " : "") +
-        "aucune cote 1,5/2,5 reçue (secours OddsPapi : " + (fallbackErr ? "erreur — " + fallbackErr : "exécuté sans erreur mais sans donnée") + ") — marchés reçus par book (Odds API) : " + detail;
+      if (noTotalsAtAll) {
+        for (const k of ["oO25", "oU25", "oO15", "oU15"]) {
+          if (totalsMissing[k] && fallback[k] && fallback[k].length) {
+            collect[k] = fallback[k];
+            filledTotals += fallback[k].length;
+          }
+        }
+      }
+      if (noBttsAtAll && (fallback.oBTTSyes.length || fallback.oBTTSno.length)) {
+        collect.oBTTSyes = fallback.oBTTSyes;
+        collect.oBTTSno = fallback.oBTTSno;
+        filledBtts = fallback.oBTTSyes.length + fallback.oBTTSno.length;
+      }
     }
+    const parts = [];
+    if (originalIssue) parts.push(originalIssue);
+    if (noTotalsAtAll) {
+      if (filledTotals > 0) {
+        parts.push("totaux partiellement absents chez Winamax/Unibet/Betclic \u2014 complet\u00e9s via OddsPapi (secours, " + filledTotals + " cotes trouv\u00e9es)");
+      } else {
+        const detail = Object.keys(marketsSeenPerBook).length
+          ? Object.entries(marketsSeenPerBook).map(([book, mks]) => book + " : " + mks).join(" \u00b7 ")
+          : "aucun bookmaker demand\u00e9 n'a r\u00e9pondu pour ce match";
+        parts.push("aucune cote 1,5/2,5 manquante re\u00e7ue (secours OddsPapi : " + (fallbackErr ? "erreur \u2014 " + fallbackErr : "ex\u00e9cut\u00e9 sans erreur mais sans donn\u00e9e") + ") \u2014 march\u00e9s re\u00e7us par book (Odds API) : " + detail);
+      }
+    }
+    if (noBttsAtAll) {
+      if (filledBtts > 0) {
+        parts.push("BTTS absent chez Winamax/Unibet/Betclic -- compl\u00e9t\u00e9 via OddsPapi (secours, " + filledBtts + " cotes trouv\u00e9es)");
+      } else if (fallbackErr) {
+        parts.push("BTTS : secours OddsPapi en erreur (" + fallbackErr + ")");
+      }
+    }
+    totalsWarning = parts.length ? parts.join(" \u00b7 ") : originalIssue;
   }
 
-  const noBttsAtAll = !collect.oBTTSyes.length && !collect.oBTTSno.length;
-if (noBttsAtAll) {
-  // Secours OddsPapi pour BTTS -- même principe que noTotalsAtAll
-  // ci-dessus. Jamais fatal : si ça échoue, "cote --" reste affiché
-  // comme avant, sans casser le reste du lookup.
-  let bttsFallback = null;
-  let bttsFallbackErr = null;
-  try { bttsFallback = await fetchOddsPapiBttsFallback(env, homeName, awayName); } catch (e) { bttsFallbackErr = e.message; }
-  if (bttsFallback) {
-    collect.oBTTSyes = bttsFallback.oBTTSyes;
-    collect.oBTTSno = bttsFallback.oBTTSno;
-    totalsWarning = (totalsWarning ? totalsWarning + " · " : "") +
-      "BTTS absent chez Winamax/Unibet/Betclic -- complété via OddsPapi (secours, " +
-      (bttsFallback.oBTTSyes.length + bttsFallback.oBTTSno.length) + " cotes trouvées)";
-  } else if (bttsFallbackErr) {
-    totalsWarning = (totalsWarning ? totalsWarning + " · " : "") +
-      "BTTS : secours OddsPapi en erreur (" + bttsFallbackErr + ")";
-  }
-}
-
-// On retient la MEILLEURE cote disponible (celle qui te paierait le plus),
+  // On retient la MEILLEURE cote disponible (celle qui te paierait le plus),
   // pas la moyenne : un parieur value ne mise jamais "à la moyenne", il
   // prend toujours la meilleure cote qu'il peut réellement obtenir. La
   // moyenne sous-estimait systématiquement la value réellement capturable.

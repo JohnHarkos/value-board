@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Value Board v3</title>
+<title>Boussole</title>
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#101820">
 <link rel="apple-touch-icon" href="icon-192.png">
@@ -222,6 +222,8 @@ svg.spark{width:100%;height:66px;display:block;margin-top:10px}
 
 /* --- carte values (résumé en haut) --- */
 .vrow{padding:10px 0;border-bottom:1px solid var(--line)}
+.vrow.coherVert{border-left:3px solid #22C55E;padding-left:9px;background:rgba(34,197,94,.06)}
+.vrow.coherOrange{border-left:3px solid #F59E0B;padding-left:9px;background:rgba(245,158,11,.06)}
 .vrow:last-child{border-bottom:0}
 .vtop{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
 .vname{font-weight:600;font-size:14px}
@@ -290,7 +292,7 @@ nav{background:rgba(12,18,24,.92) !important;backdrop-filter:blur(14px) !importa
 <body>
 
 <header>
-  <h1>Value <span>Board</span></h1>
+  <h1>Bou<span>ssole</span></h1>
   <div class="modesw" id="modeToggle" title="Basculer le mode d'analyse">
     <span class="dot"></span><span id="modeLabel">DOUBLE</span>
   </div>
@@ -315,7 +317,7 @@ nav{background:rgba(12,18,24,.92) !important;backdrop-filter:blur(14px) !importa
   </section>
 
   <div class="verdict" id="verdict">
-    <div class="lead">Verdict</div>
+    <div class="lead">Verdict <span id="xgBadge" style="display:none;font-size:11px;padding:1px 6px;border-radius:4px;font-weight:700;margin-left:6px;vertical-align:middle"></span></div>
     <div class="big">En attente de données</div>
     <div class="sub">Colle un code, ou saisis les chiffres plus bas. Le calcul se met à jour tout seul.</div>
   </div>
@@ -536,7 +538,7 @@ nav{background:rgba(12,18,24,.92) !important;backdrop-filter:blur(14px) !importa
       Les moyennes d'équipe sont ramenées vers la moyenne du championnat, d'autant plus fort que l'échantillon est petit.<br><br>
       Le modèle applique aussi une petite correction (Dixon-Coles) sur les scores bas — 0-0, 1-0, 0-1, 1-1 sont statistiquement un peu plus fréquents dans le vrai football que ce que prédit un Poisson parfaitement indépendant. Ça affine surtout les marchés BTTS et Under 1,5/2,5.<br><br>
       Une value réelle dépasse rarement 15 %. Au-delà de 40 %, l'app bloque : c'est une erreur de saisie, jamais une aubaine.<br><br>
-      Le badge <b style="color:var(--sky)">échantillon faible</b> apparaît quand l'équipe à domicile ou à l'extérieur a joué moins de 8 matchs cette saison — c'est le seuil où le repli statistique (shrinkage) fait déjà plus confiance à la moyenne du championnat qu'aux stats de l'équipe elle-même. Ce n'est pas un rejet, juste une invitation à redoubler de prudence.<br><br>
+      Le badge <b style="color:var(--sky)">échantillon faible</b> apparaît quand l'équipe à domicile ou à l'extérieur a joué moins de 8 matchs cette saison — un seuil de prudence volontairement large (le repli statistique lui-même atteint déjà 50% de poids sur la moyenne du championnat dès 3 matchs joués). Ce n'est pas un rejet, juste une invitation à redoubler de prudence.<br><br>
       Depuis "Chercher automatiquement", la cote pré-remplie est la <b style="color:var(--gold)">meilleure cote réellement disponible</b> parmi les bookmakers consultés — pas une moyenne. Le nom du bookmaker s'affiche juste en dessous ("meilleure cote : X"), pour savoir où la miser à ce prix. Chaque cote affiche aussi le nombre de bookmakers consultés et leur écart en %. <b style="color:var(--gold)">Écart sous 10%</b> : les books sont d'accord, cote fiable. <b style="color:var(--sky)">10-25%</b> : dispersion normale. <b style="color:var(--rose)">Au-delà de 25%</b> : les bookmakers ne sont pas alignés sur ce marché, à regarder de plus près avant de jouer.
     </p>
   </section>
@@ -657,6 +659,22 @@ let pinnacleData = null;
 // En mode sport le xG ne valide plus rien : on ne l'affiche plus dans
 // les listes. Il reste calcule, et une alerte apparait si l'ecart entre
 // les deux lectures depasse 20 points.
+function majBadgeXg(){
+  const b=document.getElementById('xgBadge');
+  if(!b) return;
+  b.style.display='inline-block';
+  if(xgIndispo){
+    b.textContent='xG absent';
+    b.style.background='rgba(248,113,113,.15)';
+    b.style.color='#F87171';
+    b.title='Ce championnat n est pas couvert par Understat : une seule lecture (buts reels). Sois plus prudent.';
+  } else {
+    b.textContent='xG actif';
+    b.style.background='rgba(74,222,128,.15)';
+    b.style.color='#4ADE80';
+    b.title='xG disponible : deux lectures independantes (buts reels + occasions). Securite maximale.';
+  }
+}
 const epureSport = () => analysisMode==='sport' || xgIndispo;
 // Mode sport : le chiffre principal melange 70% xG + 30% buts reels. Mesure
 // sur 18893 predictions, 5 championnats : buts purs 0.5946, xG purs 0.5925,
@@ -742,10 +760,16 @@ function confirmeMode(p, E){
   return true;
 }
 function applyMode(){
+  // Si le championnat n a pas de xG, l app est de toute facon en lecture
+  // unique (epureSport tient compte de xgIndispo) : le bouton double/sport
+  // n a aucun effet. On l indique au lieu d afficher un "DOUBLE" trompeur.
   const sport = analysisMode==='sport';
-  document.body.classList.toggle('sportmode', sport);
+  const effectifSport = sport || xgIndispo;
+  document.body.classList.toggle('sportmode', effectifSport);
   const lab=document.getElementById('modeLabel');
-  if(lab) lab.textContent = sport ? 'SPORT' : 'DOUBLE';
+  if(lab) lab.textContent = xgIndispo ? 'AUTO · buts seuls' : (sport ? 'SPORT' : 'DOUBLE');
+  const t=document.getElementById('modeToggle');
+  if(t) t.style.opacity = xgIndispo ? '0.5' : '1';
 }
 (function initMode(){
   try{ analysisMode = localStorage.getItem('vb3_mode')==='sport' ? 'sport':'double'; }
@@ -1219,6 +1243,7 @@ async function runAutoFetch(){
     pinnacleData = data.pinnacle || null;
     xgIndispo = !COUVERTS.test(lgTxt)
       || (data.warnings||[]).some(w=>/non couvert par Understat/i.test(w));
+    majBadgeXg(); applyMode();
     const oddsFailed=(data.warnings||[]).some(w=>w.startsWith('cotes'));
     if(statsFailed) ['a1','a2','a3','a4'].forEach(clearField);
     if(xgFailed) ['b1','b2','b3','b4'].forEach(clearField);
@@ -1258,12 +1283,28 @@ async function runAutoFetch(){
     // Meilleure cote disponible : la cote pré-remplie est déjà la meilleure
     // parmi les books consultés (pas une moyenne) — on affiche juste où
     // la trouver pour pouvoir réellement la miser à ce prix.
+    // Ajoute le 12/09/2026 -- les slugs OddsPapi peuvent porter un suffixe
+    // technique imprevisible ("pinnacle+30" au lieu de "pinnacle", deja
+    // rencontre ce soir sur Everton vs Manchester United) -- ce suffixe
+    // sert uniquement a isTrustedOddsPapiBook() cote serveur (startsWith,
+    // jamais touche ici) mais n'a aucun sens a montrer a l'ecran. On
+    // nettoie donc UNIQUEMENT le texte affiche, jamais la donnee brute
+    // utilisee pour le matching.
+    const cleanBookName=raw=>{
+      if(!raw) return raw;
+      const m=raw.match(/^([a-z0-9]+)(\+\d+)?(\s*\(.+\))?$/i);
+      if(!m) return raw;
+      const base=m[1], suffix=m[3]||'';
+      const NOMS_PROPRES={pinnacle:'Pinnacle',bet365:'Bet365',unibet:'Unibet',bwin:'Bwin',betclic:'Betclic',williamhill:'William Hill',betfair:'Betfair',marathonbet:'Marathon Bet',"1xbet":'1xBet',betsson:'Betsson'};
+      const propre=NOMS_PROPRES[base.toLowerCase()];
+      return propre ? propre+suffix : raw;
+    };
     Object.keys(KEY2MK).forEach(ok=>{
       const mk=KEY2MK[ok], el=$('book_'+mk); if(!el) return;
       const book=data.oddsBestBook ? data.oddsBestBook[ok] : null;
       if(!book){ el.style.display='none'; el.textContent=''; return; }
       el.style.display='block';
-      el.textContent='meilleure cote : '+book;
+      el.textContent='meilleure cote : '+cleanBookName(book);
       el.style.color='var(--gold)';
     });
 
@@ -1306,7 +1347,10 @@ async function runAutoFetch(){
       const clearedNote=clearedParts.length
         ? '<br><span style="color:var(--muted)">Champs vidés pour éviter un calcul basé sur le match précédent : '+clearedParts.join(', ')+'.</span>'
         : '';
-      if(hint) hint.innerHTML='<b style="color:var(--rose)">Incomplet :</b> '+data.warnings.join(' · ')+clearedNote;
+      if(hint) hint.innerHTML='<b style="color:var(--rose)">Incomplet :</b>'
+        +'<ul style="margin:6px 0 0;padding-left:18px">'
+        +data.warnings.map(w=>'<li style="margin-bottom:3px">'+escapeHtml(w)+'</li>').join('')
+        +'</ul>'+clearedNote;
     } else {
       if(hint) hint.textContent='Toutes les sources ont répondu.';
       toast('Données trouvées');
@@ -1448,11 +1492,24 @@ async function logAutoSignals(picks, sane, scroll){
   let added = false;
   picks.forEach(p=>{
     if(existingKeys.has(p.label)) return;
+    // Ajoute le 11/09/2026 -- meme filtre strict que le bouton "Ajouter"
+    // manuel (pastille verte ou orange uniquement) : ce chemin automatique
+    // (logAutoSignals, declenche par "Chercher automatiquement") loggait
+    // jusqu'ici TOUS les marches avec une cote saisie, sans aucune
+    // verification de coherence -- un chemin totalement separe du bouton
+    // d'ajout manuel, oublie lors du premier patch de filtrage. Confirme
+    // en direct sur Jaguares vs Fortaleza : 3 marches sans aucune pastille
+    // s'etaient quand meme retrouves dans le journal via ce mecanisme.
+    const coh=niveauCoherence(p);
+    if(coh!=='vert'&&coh!=='orange') return;
     bets.unshift({
-      id: Date.now()+'_'+p.k, date: today, match: mName, market: p.label,
+      id: Date.now()+'_'+p.k, date: today, match: mName,
+      k:p.k,homeName:($('tH')&&$('tH').value||'').trim(),awayName:($('tA')&&$('tA').value||'').trim(),
+      league:($('lgName')&&$('lgName').value||'').trim(),season:($('season')&&$('season').value||'').trim(),
+      market: p.label,
       odd: p.o, stake: 0, vA: p.vA, vB: p.vB, status: 'auto',
-      kickoff: '', book: '', mode: (typeof analysisMode!=='undefined'?analysisMode:'double'),
-      closingOdd: null, auto: true, worst: p.worst, suspect: p.suspect
+      kickoff: ($('pickKickoff')?$('pickKickoff').value:'')||'', book: ($('pickBook')?$('pickBook').value:'')||'', mode: (typeof analysisMode!=='undefined'?analysisMode:'double'),
+      closingOdd: null, auto: true, worst: p.worst, suspect: p.suspect, coherence: coh
     });
     added = true;
   });
@@ -1530,12 +1587,18 @@ function renderValues(picks,E,sane){
     return;
   }
 
-  const playable=picks.filter(p=>coteJouable(p) && confirmeMode(p,E));
-  const rest=picks.filter(p=>!(coteJouable(p) && confirmeMode(p,E)));
-  const ordered=playable.concat(rest);
+  // Corrige le 06/09/2026 -- n'affiche desormais QUE les marches avec une
+  // pastille de coherence verte ou orange (niveauCoherence), le seul
+  // signal valide par le vrai backtest (50000 paris). Le "picks" complet,
+  // lui, continue d'etre enregistre integralement dans le journal vivant
+  // via logAutoSignals -- appelee AVANT render() dans analyse(), donc
+  // jamais affectee par ce filtre d'affichage. Vert affiche avant orange.
+  const ordered=picks
+    .filter(p=>niveauCoherence(p)==='vert'||niveauCoherence(p)==='orange')
+    .sort((a,b)=>(niveauCoherence(a)==='vert'?0:1)-(niveauCoherence(b)==='vert'?0:1));
 
-  if(empty) empty.style.display=playable.length?'none':'block';
-  if(empty && playable.length===0) empty.innerHTML='Aucun marché ne dépasse le seuil dans les deux lectures à la fois — c\'est un résultat normal, pas un échec.';
+  if(empty) empty.style.display=ordered.length?'none':'block';
+  if(empty && ordered.length===0) empty.innerHTML='Aucun marché ne remplit les critères de cohérence (pastille verte ou orange) sur ce match — résultat normal, pas un échec.';
 
   const cl=v=>v>=E?'pos':(v>0?'neu':'neg');
   tbl.innerHTML=ordered.map(p=>{
@@ -1558,7 +1621,7 @@ function renderValues(picks,E,sane){
     const modeleTxt = epureSport()
       ? (probaSport(p)*100).toFixed(0)+'%'
       : lo+'\u2013'+hi+'%';
-    return '<div class="vrow">'+
+    return '<div class="vrow'+(niveauCoherence(p)==='vert'?' coherVert':niveauCoherence(p)==='orange'?' coherOrange':'')+'">'+
       `<div class="vtop"><span class="vname">${p.label}${tag}${(function(){const n=niveauCoherence(p);return n==='vert'?'<span class="pastilleConf" title="Coherence forte : modele et book d accord a moins de 3 points, cote 1.50-1.75. ROI historique +4.9% sur 498 paris."></span>':n==='orange'?'<span class="pastilleOr" title="Coherence moyenne : accord a moins de 5 points, cote 1.45-1.85. ROI historique +1.7% sur 1423 paris."></span>':'';})()}</span><span class="vodd">cote ${fmt(p.o)}</span></div>`+
       `<div class="vmeta">modèle ${modeleTxt} · bookmaker ${implied}%${pinInline(p)} · `+
       `<b class="${cl(epureSport()?p.vS:p.vA)}">${(epureSport()?p.vS:p.vA)>=0?'+':''}${(epureSport()?p.vS:p.vA).toFixed(1)}%</b>`+
@@ -1630,13 +1693,16 @@ function renderProno(picks,E,sane){
 function render(picks,sane){
   const span=Math.max(15,...picks.map(p=>Math.max(Math.abs(p.vA),Math.abs(p.vB))));
   const E=cfg.minEdge;
-  // Échantillon faible : sous nH/nA=8, le shrinkage (K=8) fait déjà plus
-  // confiance à la moyenne du championnat qu'aux vraies stats de l'équipe.
+  // Échantillon faible : le seuil d'affichage du badge (8 matchs) reste
+  // volontairement plus prudent que K -- corrige le 12/09/2026, K est
+  // passe de 8 a 3 (voir plus haut dans ce fichier) sans que ce
+  // commentaire ni celui du dessous n'aient ete mis a jour a l'epoque.
   const lowSample=num('nH',9)<8||num('nA',9)<8;
-  // Sous 3 matchs joues, le shrinkage (K=8) remplace plus de 70% de la
-  // donnee par la moyenne du championnat : le "modele" ne decrit plus
-  // l'equipe mais le championnat. Afficher un pourcentage precis dans ce
-  // cas fabrique une confiance qui n'a aucun fondement -- on refuse.
+  // Sous 3 matchs joues (= K actuel), le shrinkage remplace 50% de la
+  // donnee par la moyenne du championnat (K/(n+K) = 3/(3+3) = 50%,
+  // recalcule le 12/09/2026 -- sous l'ancien K=8 c'etait plus de 70%,
+  // ce chiffre a change avec le K). Afficher un pourcentage precis dans
+  // ce cas fabrique une confiance qui n'a aucun fondement -- on refuse.
   const MIN_MATCHS_FIABLE = 3;
   const donneesInsuffisantes = num('nH',9)<MIN_MATCHS_FIABLE || num('nA',9)<MIN_MATCHS_FIABLE;
   const badge=$('sampleBadge');
@@ -1931,13 +1997,28 @@ on('addBet','click',async()=>{
   const st=num('pickStake',0);
   if(!p){toast('Lance d\'abord une analyse');return}
   if(!st||st<=0){toast('Indique une mise positive');return}
+  // Ajoute le 07/09/2026 -- filtre strict : seuls les paris avec pastille
+  // verte ou orange (cote 1.45-1.85, ecart modele/book < 5 points) peuvent
+  // rejoindre le journal, pour que le suivi de performance par marche/par
+  // pastille ne soit jamais pollue par des paris hors de ce critere de
+  // coherence. Le niveau est aussi stocke sur le pari lui-meme, pour
+  // permettre plus tard une analyse ROI vert vs orange, en plus du
+  // decoupage par marche deja existant.
+  const coh=niveauCoherence(p);
+  if(coh!=='vert'&&coh!=='orange'){
+    toast('Ajout refuse : ce marche n\'a pas de pastille verte ou orange (coherence insuffisante)');
+    return;
+  }
   await rememberTeam($('tH')?$('tH').value:'');
   await rememberTeam($('tA')?$('tA').value:'');
   bets.unshift({id:Date.now(),date:new Date().toISOString().slice(0,10),match:matchName(),
+    k:p.k,homeName:($('tH')&&$('tH').value||'').trim(),awayName:($('tA')&&$('tA').value||'').trim(),
+    league:($('lgName')&&$('lgName').value||'').trim(),season:($('season')&&$('season').value||'').trim(),
     market:p.label,odd:p.o,stake:st,vA:p.vA,vB:p.vB,status:'pending',
     kickoff:($('pickKickoff')?$('pickKickoff').value:'')||'',
     book:($('pickBook')?$('pickBook').value:'')||'',
     mode:(typeof analysisMode!=='undefined'?analysisMode:'double'),
+    coherence:coh,
     closingOdd:null});
   await Store.set('vb3_bets',bets); renderJournal(); toast('Pari enregistré');
 });
@@ -1960,6 +2041,65 @@ on('filters','click',e=>{
 });
 on('journalSearch','input',e=>{ journalQuery=(e.target.value||'').toLowerCase(); renderJournal(); });
 
+// Ajoute le 11/09/2026 -- reglement automatique du journal : a chaque
+// chargement de la page, verifie si les paris en attente (pending/auto)
+// dont le match est probablement termine ont un resultat disponible cote
+// API-Football (/api/result), et regle won/lost tout seul en reutilisant
+// f(i,j) du tableau MARKETS -- jamais une nouvelle logique de calcul,
+// juste une nouvelle source (score reel au lieu d'une probabilite). Best-
+// effort strict : un match pas encore trouve/termine, ou une erreur reseau
+// ponctuelle, ne bloque rien -- on reessaiera simplement au chargement
+// suivant.
+function estimatedMatchEndTime(b){
+  if(b.kickoff){
+    const kt=new Date(b.kickoff);
+    if(!isNaN(kt)) return kt.getTime()+3*3600000; // +3h : duree match + marge
+  }
+  // Repli si aucune heure de coup d'envoi renseignee : on suppose le match
+  // termine a la fin de la journee indiquee -- prudent, jamais trop tot.
+  const d=new Date(b.date+'T23:59:59');
+  return isNaN(d)?null:d.getTime();
+}
+async function autoSettleBets(){
+  if(!cfg.workerUrl) return; // pas de relais configure, rien a verifier
+  const now=Date.now();
+  const candidates=bets.filter(b=>{
+    if(b.status!=='pending'&&b.status!=='auto') return false;
+    if(!b.k||!b.homeName||!b.awayName||!b.league) return false; // paris crees avant ce correctif -- pas assez d'infos pour regler automatiquement, restent a regler a la main
+    const endTime=estimatedMatchEndTime(b);
+    return endTime!==null&&now>endTime;
+  });
+  if(!candidates.length) return;
+  let changed=false;
+  for(const b of candidates){
+    try{
+      // Corrige le 12/09/2026 -- b.date est la date d'AJOUT au journal
+      // (souvent la veille du match, si l'analyse a ete faite avant le
+      // coup d'envoi), pas la date du match lui-meme -- getMatchResult()
+      // cherche un match precisement CE jour-la, donc utiliser b.date
+      // ratait systematiquement les matchs analyses la veille (confirme
+      // en direct sur Jeonbuk Motors vs FC Seoul : pari logge le 11,
+      // match reellement joue le 12, recherche du 11 = aucun resultat).
+      // On prefere desormais la date du coup d'envoi (b.kickoff, deja
+      // stockee) quand elle est disponible, et on ne retombe sur b.date
+      // que si kickoff est vide.
+      const kt=b.kickoff?new Date(b.kickoff):null;
+      const matchDate=(kt&&!isNaN(kt))?kt.toISOString().slice(0,10):b.date;
+      const params=new URLSearchParams({home:b.homeName,away:b.awayName,league:b.league,season:b.season||String(new Date().getFullYear()),date:matchDate});
+      if(cfg.relayKey) params.set('key',cfg.relayKey);
+      const r=await fetch(cfg.workerUrl+'/api/result?'+params.toString()).then(x=>x.json());
+      if(r.error) continue; // match pas encore termine/trouve -- on retentera au prochain chargement
+      const mk=MARKETS.find(m=>m.k===b.k);
+      if(!mk) continue;
+      b.status=mk.f(r.homeGoals,r.awayGoals)?'won':'lost';
+      b.finalScore=r.homeGoals+'-'+r.awayGoals;
+      changed=true;
+    }catch(e){
+      // best-effort : panne reseau ponctuelle, on retentera au prochain chargement
+    }
+  }
+  if(changed){ await Store.set('vb3_bets',bets); renderJournal(); }
+}
 function renderJournal(){
   const played=bets.filter(b=>b.status!=='noplay');
   const settled=played.filter(b=>b.status==='won'||b.status==='lost');
@@ -2257,6 +2397,7 @@ document.addEventListener('keydown',e=>{
   }catch(e){}
   loadCfg(); refreshLam(); renderJournal();
   ODD_IDS.forEach(o=>updateImplied(o.slice(2)));
+  autoSettleBets(); // best-effort, ne bloque jamais le chargement de la page
 })();
 
 // PWA : n'a de sens que servie en HTTPS (ou localhost) — un simple fichier
