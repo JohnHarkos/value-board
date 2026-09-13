@@ -1582,7 +1582,7 @@ function analyse(scroll){
   });
   lastPicks=picks; logAutoSignals(picks, sane, scroll);
   render(picks,sane);
-  if($('detailWrap'))$('detailWrap').style.display='block';
+  if($('detailWrap'))$('detailWrap').style.display='none'; // bloc detail value retire le 13/09 : n'aidait pas a decider (value = bruit)
   if($('saveWrap'))$('saveWrap').style.display='block';
   const v=$('verdict');
   if(scroll&&v)v.scrollIntoView({behavior:'smooth',block:'start'});
