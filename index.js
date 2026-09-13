@@ -2457,6 +2457,16 @@ async function getOdds(env, sportKey, homeName, awayName) {
         collect.oBTTSno = fallback.oBTTSno;
         filledBtts = fallback.oBTTSyes.length + fallback.oBTTSno.length;
       }
+      // Completer le repere Pinnacle avec les marches OddsPapi (BTTS, totaux)
+      // -- ajoute le 13/09/2026. out.pinnacle a deja le 1N2 (via The Odds API)
+      // mais pas ces marches secondaires que Pinnacle ne cote que chez OddsPapi.
+      const pinPx = (arr) => { if(!arr||!arr.length) return null; const x=arr.find(o=>/pinnacle/i.test(o.book||"")); return x?x.price:null; };
+      const nv2 = (a,b) => { const ia=1/a, ib=1/b, t=ia+ib; return [ia/t, ib/t]; };
+      if (!out.pinnacle) out.pinnacle = { p1:null, pX:null, p2:null, pO25:null, pU25:null };
+      const pO=pinPx(collect.oO25), pU=pinPx(collect.oU25);
+      if (pO && pU && out.pinnacle.pO25==null) { const [a,b]=nv2(pO,pU); out.pinnacle.pO25=a; out.pinnacle.pU25=b; }
+      const pBy=pinPx(collect.oBTTSyes), pBn=pinPx(collect.oBTTSno);
+      if (pBy && pBn && out.pinnacle.pBTTSyes==null) { const [a,b]=nv2(pBy,pBn); out.pinnacle.pBTTSyes=a; out.pinnacle.pBTTSno=b; }
     }
     const parts = [];
     if (originalIssue) parts.push(originalIssue);
