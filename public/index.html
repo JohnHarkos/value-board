@@ -651,6 +651,11 @@ let lastPicks=[];
 // 'double' = buts reels ET xG doivent valider. 'sport' = buts reels seuls.
 let analysisMode='double';
 let xgIndispo = false;
+// Ajoute le 13/09/2026 -- niveau de confiance du xG (1.0 = frais, jusqu'a
+// 0.3 si perime au-dela du seuil de fraicheur), calcule cote serveur et
+// renvoye dans data.values.xgConfiance -- utilise pour reduire (pas
+// annuler) le poids du xG dans le melange avec les buts reels.
+let xgConfiance = 1;
 // Repere Pinnacle (no-vig) recu du serveur. REPERE seulement : le backtest
 // du 15/08 a montre qu acheter les ecarts vs Pinnacle perd (-1% a -13%).
 let pinnacleData = null;
@@ -1228,7 +1233,11 @@ async function runAutoFetch(){
     // volontairement mémorisés d'un match à l'autre et ne doivent PAS être
     // vidés ici).
     const statsFailed=(data.warnings||[]).some(w=>w.startsWith('stats (API-Football)'));
-    const xgFailed=(data.warnings||[]).some(w=>w.startsWith('xG (Understat)'));
+    // Corrige le 13/09/2026 -- reste de l'ere Understat (remplace par
+    // TheStatsAPI cette nuit) : ce test ne matchait plus jamais rien
+    // depuis le renommage du prefixe d'avertissement, ce qui empechait
+    // silencieusement le nettoyage des champs b1-b4 en cas d'echec reel.
+    const xgFailed=(data.warnings||[]).some(w=>w.startsWith('xG (TheStatsAPI)') || w.startsWith('xG domicile (TheStatsAPI)') || w.startsWith('xG extérieur (TheStatsAPI)'));
     // Understat ne couvre que 6 championnats. Ailleurs (Portugal, Pays-Bas,
     // promus de Liga...), le champ xG retombe sur la moyenne du championnat.
     // Ce n'est alors PAS une seconde lecture : comparer l'equipe reelle a une
@@ -1238,11 +1247,18 @@ async function runAutoFetch(){
     // d erreur (qui varie selon la cause) mais directement au nom du
     // championnat : ailleurs, le champ xG est un repli sur la moyenne, pas
     // une seconde lecture.
-    const lgTxt = ($('lgName') ? $('lgName').value : '').toLowerCase();
-    const COUVERTS = /premier league|epl|angleterre|la liga|laliga|espagne|bundesliga|allemagne|serie a|italie|ligue 1|france|rfpl|russie/;
+    // Corrige le 13/09/2026 -- cette liste figee (COUVERTS) datait des 6
+    // championnats Understat et n'a jamais ete mise a jour lors du
+    // remplacement par TheStatsAPI (116+ championnats) : xgIndispo restait
+    // donc VRAI pour la quasi-totalite des championnats analyses cette
+    // nuit, meme quand TheStatsAPI avait reussi a fournir un xG frais --
+    // le xG s'affichait dans b1-b4 mais etait silencieusement ignore du
+    // calcul de probabilite (badge "AUTO . buts seuls" errone). On se fie
+    // desormais a la VRAIE disponibilite des donnees renvoyees par le
+    // serveur, peu importe le championnat.
     pinnacleData = data.pinnacle || null;
-    xgIndispo = !COUVERTS.test(lgTxt)
-      || (data.warnings||[]).some(w=>/non couvert par Understat/i.test(w));
+    xgIndispo = data.values.b1==null || data.values.b2==null || data.values.b3==null || data.values.b4==null;
+    xgConfiance = data.values.xgConfiance ?? 1;
     majBadgeXg(); applyMode();
     const oddsFailed=(data.warnings||[]).some(w=>w.startsWith('cotes'));
     if(statsFailed) ['a1','a2','a3','a4'].forEach(clearField);
@@ -1509,7 +1525,8 @@ async function logAutoSignals(picks, sane, scroll){
       market: p.label,
       odd: p.o, stake: 0, vA: p.vA, vB: p.vB, status: 'auto',
       kickoff: ($('pickKickoff')?$('pickKickoff').value:'')||'', book: ($('pickBook')?$('pickBook').value:'')||'', mode: (typeof analysisMode!=='undefined'?analysisMode:'double'),
-      closingOdd: null, auto: true, worst: p.worst, suspect: p.suspect, coherence: coh
+      closingOdd: null, auto: true, worst: p.worst, suspect: p.suspect, coherence: coh,
+      xgUtilise: !xgIndispo
     });
     added = true;
   });
@@ -1525,7 +1542,13 @@ function analyse(scroll){
     if(!o||o<1.01) return;
     const pA=sumIf(mA,mk.f), pB=sumIf(mB,mk.f);
     const vA=(pA*o-1)*100, vB=(pB*o-1)*100;
-    const pS = (xgIndispo || pB == null) ? pA : (0.70*pB + 0.30*pA);
+    // Corrige le 13/09/2026 -- le poids du xG dans le melange n'est plus
+    // fixe a 70% : il est desormais proportionnel a xgConfiance (1.0 si
+    // frais, jusqu'a 0.3 si perime au-dela du seuil de fraicheur) --
+    // POIDS_XG reste le plafond (jamais depasse), la confiance ne fait
+    // que le reduire, jamais l'augmenter.
+    const poidsXGEffectif = POIDS_XG * xgConfiance;
+    const pS = (xgIndispo || pB == null) ? pA : (poidsXGEffectif*pB + (1-poidsXGEffectif)*pA);
     const vS = (pS*o-1)*100;
     // Round 38 — un seul marché avec une value >40% (typiquement une
     // cote isolée chez un bookmaker parmi ceux consultés, pas forcément
@@ -1610,9 +1633,8 @@ function renderValues(picks,E,sane){
     // ce n'est probablement pas une vraie opportunité mais un prix à
     // vérifier avant de parier dessus.
     const tag=p.suspect?'<span class="tag mix">cote isolée — à vérifier</span>'
-            :both?'<span class="tag go">à jouer</span>'
             :mixed?'<span class="tag mix">contradiction</span>'
-            :'<span class="tag no">non</span>';
+            :'';
     const lo=(Math.min(p.pA,p.pB)*100).toFixed(0), hi=(Math.max(p.pA,p.pB)*100).toFixed(0);
     const implied=(100/p.o).toFixed(0);
     // En mode sport, seule la lecture buts reels decide : afficher une
@@ -1623,11 +1645,8 @@ function renderValues(picks,E,sane){
       : lo+'\u2013'+hi+'%';
     return '<div class="vrow'+(niveauCoherence(p)==='vert'?' coherVert':niveauCoherence(p)==='orange'?' coherOrange':'')+'">'+
       `<div class="vtop"><span class="vname">${p.label}${tag}${(function(){const n=niveauCoherence(p);return n==='vert'?'<span class="pastilleConf" title="Coherence forte : modele et book d accord a moins de 3 points, cote 1.50-1.75. ROI historique +4.9% sur 498 paris."></span>':n==='orange'?'<span class="pastilleOr" title="Coherence moyenne : accord a moins de 5 points, cote 1.45-1.85. ROI historique +1.7% sur 1423 paris."></span>':'';})()}</span><span class="vodd">cote ${fmt(p.o)}</span></div>`+
-      `<div class="vmeta">modèle ${modeleTxt} · bookmaker ${implied}%${pinInline(p)} · `+
-      `<b class="${cl(epureSport()?p.vS:p.vA)}">${(epureSport()?p.vS:p.vA)>=0?'+':''}${(epureSport()?p.vS:p.vA).toFixed(1)}%</b>`+
-      (epureSport()
-        ? (Math.abs(p.vA-p.vB)>=20 ? ` <b style="color:var(--rose)">&#9888; xG : ${(p.pB*100).toFixed(0)}%</b>` : '')
-        : ` / <b class="${cl(p.vB)}">${p.vB>=0?'+':''}${p.vB.toFixed(1)}%</b>`)+
+      `<div class="vmeta">modèle ${modeleTxt} · bookmaker ${implied}%${pinInline(p)}`+
+      (epureSport() && Math.abs(p.vA-p.vB)>=20 ? ` · <b style="color:var(--rose)">&#9888; xG : ${(p.pB*100).toFixed(0)}%</b>` : '')+
       `</div>`+
       repereP(p)+
       (p.suspect?'<div class="hint" style="margin-top:2px">Value irréaliste sur un marché réel — probablement une cote isolée/périmée chez un bookmaker plutôt qu\'une vraie opportunité. Vérifie le consensus avant de parier dessus.</div>':'')+
@@ -1677,17 +1696,12 @@ function renderProno(picks,E,sane){
 
   const mid=p=>((p.pA+p.pB)/2*100).toFixed(0);
   const line=(p,label)=>'<div class="vrow">'+
-    `<div class="vtop"><span class="vname">${label} : ${p.label}${confirmed(p)?'<span class="tag go">à jouer</span>':''}</span><span class="vodd">cote ${fmt(p.o)}</span></div>`+
-    `<div class="vmeta">probabilité modèle ≈ ${mid(p)}% · value réels ${p.vA>=0?'+':''}${p.vA.toFixed(1)}% / xG ${p.vB>=0?'+':''}${p.vB.toFixed(1)}%</div>`+
+    `<div class="vtop"><span class="vname">${label} : ${p.label}</span><span class="vodd">cote ${fmt(p.o)}</span></div>`+
+    `<div class="vmeta">probabilité modèle ≈ ${mid(p)}%</div>`+
   '</div>';
 
-  if(favori.k===valuePick.k){
-    box.innerHTML=line(favori,'Favori et meilleure value')+
-      '<p class="hint">Le résultat le plus probable est aussi celui qui a le plus de value ici — les deux s\'alignent, ce qui n\'est pas systématique.</p>';
-  } else {
-    box.innerHTML=line(favori,'Favori (le plus probable)')+line(valuePick,'Meilleure value')+
-      '<p class="hint">Le favori et la meilleure value ne sont pas le même marché ici. Le favori dit seulement quel résultat est le plus probable — pas où la cote est mal évaluée. Seule la ligne "meilleure value" répond à cette seconde question.</p>';
-  }
+  box.innerHTML=line(favori,'Le plus probable')+
+    '<p class="hint">Le résultat que le modèle juge le plus probable sur ce match. Les pastilles verte/orange plus bas indiquent où le prix est cohérent avec la référence.</p>';
 }
 
 function render(picks,sane){
@@ -1800,8 +1814,14 @@ function render(picks,sane){
         kellyLine=`<div class="stake">Mise Kelly (${fracPct}% de Kelly) : ${kellyEuro.toFixed(2)} € · bankroll ${bank.toFixed(2)} €</div>`;
       }
     }
+    const divergSport = (analysisMode==='sport' && Math.abs(best.vA-best.vB)>=20)
+      ? ' <b style="color:var(--rose)">\u26a0 seconde lecture divergente ('+Math.abs(best.vA-best.vB).toFixed(0)+' points)</b>' : '';
+    const lo=(Math.min(best.pA,best.pB)*100).toFixed(0), hi=(Math.max(best.pA,best.pB)*100).toFixed(0);
+    const probaTxt = analysisMode==='sport'
+      ? (best.pA*100).toFixed(0)+' %'
+      : (lo===hi ? lo+' %' : 'entre '+lo+' et '+hi+' %');
     v.innerHTML='<div class="lead">Verdict</div><div class="big">'+best.label+'</div>'+
-      `<div class="sub">${sportIntro}${best.vA>=0?'+':''}${best.vA.toFixed(1)} %${sportTail}. Cote ${fmt(best.o)}, probabilité modèle ${analysisMode==='sport' ? (best.pA*100).toFixed(0)+' %' : 'entre '+(Math.min(best.pA,best.pB)*100).toFixed(0)+' et '+(Math.max(best.pA,best.pB)*100).toFixed(0)+' %'} — contre ${(100/best.o).toFixed(0)} % implicite du bookmaker.${lowSample?' <b style="color:var(--sky)">Échantillon faible</b> — moins de 8 matchs joués d\'un côté, le modèle s\'appuie surtout sur la moyenne du championnat plutôt que sur cette équipe.':''}${anySuspect?' <b style="color:var(--rose)">Un autre marché de ce match a été écarté</b> (cote isolée, value irréaliste) — sans lien avec ce pari.':''}</div>`+
+      `<div class="sub">Cote ${fmt(best.o)}, probabilité modèle ${probaTxt} — contre ${(100/best.o).toFixed(0)} % implicite du bookmaker.${divergSport}${lowSample?' <b style="color:var(--sky)">Échantillon faible</b> — moins de 8 matchs joués d\'un côté, le modèle s\'appuie surtout sur la moyenne du championnat plutôt que sur cette équipe.':''}${anySuspect?' <b style="color:var(--rose)">Un autre marché de ce match a été écarté</b> (cote isolée, value irréaliste) — sans lien avec ce pari.':''}</div>`+
       `<div class="stake">Mise fixe : ${cfg.stake.toFixed(2)} €${best.o<1.5?' · cote basse, marge élevée':''}</div>`+
       kellyLine;
   } else {
@@ -2019,6 +2039,7 @@ on('addBet','click',async()=>{
     book:($('pickBook')?$('pickBook').value:'')||'',
     mode:(typeof analysisMode!=='undefined'?analysisMode:'double'),
     coherence:coh,
+    xgUtilise:!xgIndispo,
     closingOdd:null});
   await Store.set('vb3_bets',bets); renderJournal(); toast('Pari enregistré');
 });

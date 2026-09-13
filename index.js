@@ -30,6 +30,7 @@ const env = {
   APIFOOTBALL_KEY: process.env.APIFOOTBALL_KEY,
   ODDS_API_KEY: process.env.ODDS_API_KEY,
   ODDSPAPI_API_KEY: process.env.ODDSPAPI_API_KEY,
+  THESTATSAPI_KEY: process.env.THESTATSAPI_KEY,
 };
 
 // Clé d'accès partagée : sans elle, n'importe qui trouvant l'IP du serveur
@@ -401,8 +402,7 @@ async function handleLookup(params, env) {
       return stats;
     })(),
     (async () => {
-      const slug = understatSlugFor(leagueName);
-      return await getXGViaLeague(slug, season, homeName, awayName);
+      return await getXGViaTheStatsAPI(env, leagueName, homeName, awayName, fsCountry);
     })(),
     (async () => {
       // Meme departage par pays que pour resolveLeague ci-dessus, cote
@@ -441,7 +441,7 @@ async function handleLookup(params, env) {
     xgPart = xgResult.value;
     if (xgPart?.warnings?.length) warnings.push(...xgPart.warnings);
   }
-  else warnings.push("xG (Understat): " + xgResult.reason.message);
+  else warnings.push("xG (TheStatsAPI): " + xgResult.reason.message);
 
   if (oddsResult.status === "fulfilled") {
     oddsPart = oddsResult.value.odds;
@@ -467,7 +467,7 @@ async function handleLookup(params, env) {
     oddsSpread: oddsPart?.spread || null,
     pinnacle: oddsPart?.pinnacle || null, // {marché: {spread, count}} — dispersion entre bookmakers
     oddsBestBook: oddsPart?.bestBook || null, // {marché: nom du bookmaker offrant la meilleure cote}
-    injuries: statsPart?.injuries || null, // Round 22 — {home: [...], away: [...]}, purement informatif
+    injuries: (statsPart?.injuries?.home?.length || statsPart?.injuries?.away?.length) ? statsPart.injuries : (xgPart?.injuriesTSA || null), // Round 22 + complement TheStatsAPI (13/09) — {home: [...], away: [...]}, purement informatif
     importCode: buildImportCode(homeName, awayName, statsPart, xgPart, oddsPart),
     warnings,
   };
@@ -529,8 +529,7 @@ async function handleMatch(params, env) {
       return stats;
     })(),
     (async () => {
-      const slug = understatSlugFor(leagueName);
-      return await getXGViaLeague(slug, season, homeName, awayName);
+      return await getXGViaTheStatsAPI(env, leagueName, homeName, awayName, fsCountry);
     })(),
     sportKey ? getOddsCached(env, sportKey, homeName, awayName) : Promise.reject(new Error("paramètre 'sport' non fourni")),
     fsCountry ? getLeagueAverages(leagueName, fsCountry, season) : Promise.resolve(null),
@@ -548,7 +547,7 @@ async function handleMatch(params, env) {
     xgPart = xgResult.value;
     if (xgPart?.warnings?.length) warnings.push(...xgPart.warnings);
   }
-  else warnings.push("xG (Understat): " + xgResult.reason.message);
+  else warnings.push("xG (TheStatsAPI): " + xgResult.reason.message);
 
   if (oddsResult.status === "fulfilled") {
     oddsPart = oddsResult.value.odds;
@@ -574,7 +573,7 @@ async function handleMatch(params, env) {
     oddsSpread: oddsPart?.spread || null,
     pinnacle: oddsPart?.pinnacle || null,
     oddsBestBook: oddsPart?.bestBook || null,
-    injuries: statsPart?.injuries || null, // Round 22
+    injuries: (statsPart?.injuries?.home?.length || statsPart?.injuries?.away?.length) ? statsPart.injuries : (xgPart?.injuriesTSA || null), // Round 22 + complement TheStatsAPI (13/09)
     importCode: buildImportCode(homeName, awayName, statsPart, xgPart, oddsPart),
     warnings,
   };
@@ -584,6 +583,7 @@ function buildValues(stats, xg, odds) {
   return {
     a1: stats?.a1 ?? null, a2: stats?.a2 ?? null, a3: stats?.a3 ?? null, a4: stats?.a4 ?? null,
     b1: xg?.b1 ?? null, b2: xg?.b2 ?? null, b3: xg?.b3 ?? null, b4: xg?.b4 ?? null,
+    xgConfiance: xg?.confiance ?? 1,
     lgH: stats?.lgH ?? null, lgA: stats?.lgA ?? null,
     nH: stats?.nH ?? null, nA: stats?.nA ?? null,
     o1: odds?.o1 ?? null, oX: odds?.oX ?? null, o2: odds?.o2 ?? null,
@@ -710,6 +710,41 @@ async function cacheSet(env, key, value, ttlSeconds) {
 }
 
 
+// Ajoute le 12/09/2026 -- meme schema de robustesse que apiFootballGet
+// (throttle, cache appelant, 3 tentatives avec repli 2s/4s sur rate
+// limit), adapte a TheStatsAPI : header Authorization Bearer au lieu de
+// x-apisports-key, pas de nettoyage d'accents necessaire (non teste comme
+// un probleme chez ce fournisseur, a surveiller si un cas apparait).
+async function theStatsApiGet(env, path, qs) {
+  await sleep(900); // Corrige le 12/09/2026 -- limite REELLE confirmee via les
+  // en-tetes de reponse (x-ratelimit-limit: 12, fenetre de 10 secondes) : 12
+  // requetes / 10s = ~830ms minimum entre chaque appel pour rester en dessous
+  // en rythme soutenu. 900ms retenu (marge de securite), puisqu'un match
+  // analyse peut enchainer jusqu'a ~15 appels (resolution championnat+2
+  // equipes, puis jusqu'a 12 appels /stats) -- sans marge, la fenetre de 10s
+  // serait depassee des le milieu d'une seule analyse.
+  const url = "https://api.thestatsapi.com/api" + path + (qs ? "?" + new URLSearchParams(qs) : "");
+  const MAX_ATTEMPTS = 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const res = await fetchT(url, {
+      headers: { "Authorization": "Bearer " + env.THESTATSAPI_KEY },
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      lastErr = new Error("TheStatsAPI HTTP " + res.status + " sur " + path + " — " + body.slice(0, 200));
+      if (res.status === 429 && attempt < MAX_ATTEMPTS) {
+        await sleep(2000 * attempt);
+        continue;
+      }
+      throw lastErr;
+    }
+    const data = await res.json();
+    return data.data;
+  }
+  throw lastErr;
+}
+
 async function apiFootballGet(env, path, qs) {
   // Pause avant chaque appel : filet de sécurité en plus du cache ci-dessus,
   // pour les appels qui ne peuvent pas être évités (premier lookup d'une
@@ -721,8 +756,18 @@ async function apiFootballGet(env, path, qs) {
   // chaque fonction appelante — corrige le problème pour toutes les
   // équipes/ligues accentuées d'un coup (Málaga, Deportivo La Coruña,
   // İstanbul Başakşehir...), pas seulement Vitória.
+  // Corrige le 13/09/2026 (v2) -- le retrait SYSTEMATIQUE de la ponctuation
+  // (v1, plus tot ce matin) evitait bien le crash "alpha-numeric only" sur
+  // "1. FC Heidenheim", mais cassait "Ham-Kam" : leur base stocke le nom
+  // AVEC le tiret pour l'equipe PREMIERE, alors que "HamKam" (tiret retire)
+  // ne matche que les equipes jeunes/reserve/feminine ("HamKam U19",
+  // "HamKam II", "HamKam W") -- lesquelles echouent ensuite la validation
+  // ligue/saison, produisant un faux "nom ambigu". On tente desormais
+  // D'ABORD avec la ponctuation intacte (juste les accents retires), et on
+  // ne la retire QUE si ça echoue precisement sur cette erreur de
+  // validation -- jamais preventivement.
   if (qs && typeof qs.search === "string") qs = { ...qs, search: stripDiacritics(qs.search) };
-  const url = "https://v3.football.api-sports.io" + path + "?" + new URLSearchParams(qs);
+  const buildUrl = q => "https://v3.football.api-sports.io" + path + "?" + new URLSearchParams(q);
 
   // Nouvelle tentative automatique sur rate limit : confirmé par test direct
   // (curl depuis un poste normal) que la clé et le compte ont largement du
@@ -731,39 +776,343 @@ async function apiFootballGet(env, path, qs) {
   // clé elle-même. C'est un phénomène de bruit externe, temporaire par
   // nature, donc une nouvelle tentative avec pause a de bonnes chances de
   // passer sans jamais avoir touché à la clé ou au compte.
-  const MAX_ATTEMPTS = 3;
-  let lastErr = null;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const res = await fetchT(url, {
-      headers: { "x-apisports-key": env.APIFOOTBALL_KEY },
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      lastErr = new Error("API-Football HTTP " + res.status + " sur " + path + " — " + body.slice(0, 200));
-      // Un vrai code HTTP d'échec (401, 500...) ne se règle pas en réessayant
-      // dans la seconde — pas la peine d'attendre, on sort tout de suite.
-      throw lastErr;
-    }
-    const data = await res.json();
-    const isRateLimit = data.errors && Object.keys(data.errors).some(k =>
-      /ratelimit/i.test(k) || /too many requests/i.test(String(data.errors[k])));
-    if (data.errors && Object.keys(data.errors).length && !isRateLimit) {
-      throw new Error("API-Football (" + path + "): " + JSON.stringify(data.errors));
-    }
-    if (isRateLimit) {
-      lastErr = new Error("API-Football (" + path + "): " + JSON.stringify(data.errors));
-      if (attempt < MAX_ATTEMPTS) {
-        await sleep(2000 * attempt); // 2s, puis 4s avant les tentatives suivantes
-        continue;
+  async function tenter(qsActuel, dejaNettoye) {
+    const url = buildUrl(qsActuel);
+    const MAX_ATTEMPTS = 3;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const res = await fetchT(url, {
+        headers: { "x-apisports-key": env.APIFOOTBALL_KEY },
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        lastErr = new Error("API-Football HTTP " + res.status + " sur " + path + " — " + body.slice(0, 200));
+        throw lastErr;
       }
-      throw lastErr;
+      const data = await res.json();
+      const isRateLimit = data.errors && Object.keys(data.errors).some(k =>
+        /ratelimit/i.test(k) || /too many requests/i.test(String(data.errors[k])));
+      const isSearchPunctuation = !dejaNettoye && data.errors?.search && /alpha-numeric/i.test(String(data.errors.search));
+      if (isSearchPunctuation) {
+        // Repli en dernier recours seulement : ponctuation retiree, un
+        // seul essai supplementaire (pas de nouvelle boucle de rate-limit
+        // imbriquee).
+        const qsNettoye = { ...qsActuel, search: qsActuel.search.replace(/[^a-zA-Z0-9\s]/g, "") };
+        return await tenter(qsNettoye, true);
+      }
+      if (data.errors && Object.keys(data.errors).length && !isRateLimit) {
+        throw new Error("API-Football (" + path + "): " + JSON.stringify(data.errors));
+      }
+      if (isRateLimit) {
+        lastErr = new Error("API-Football (" + path + "): " + JSON.stringify(data.errors));
+        if (attempt < MAX_ATTEMPTS) {
+          await sleep(2000 * attempt); // 2s, puis 4s avant les tentatives suivantes
+          continue;
+        }
+        throw lastErr;
+      }
+      return data.response;
     }
-    return data.response;
+    throw lastErr;
   }
-  throw lastErr;
+  return await tenter(qs, false);
+}
+
+// Ajoute le 12/09/2026 -- integration TheStatsAPI (remplace Understat pour
+// le xG). Deux differences cle avec Understat : (1) couverture bien plus
+// large (120+ championnats vs 6), mais (2) le xG n'est disponible qu'au
+// niveau MATCH INDIVIDUEL (/matches/{id}/stats), jamais en agregat par
+// equipe/saison -- confirme en direct, /teams/{id}/stats ne contient
+// aucun champ xG. Consequence : contrairement a Understat (page unique par
+// equipe), chaque match recent necessite son propre appel /stats, d'ou la
+// limite a 6 matchs par cote (domicile/exterieur) plutot que l'historique
+// complet de la saison, pour rester dans un budget de requetes raisonnable.
+//
+// Garde-fou de fraicheur : leur pipeline de traitement xG a un retard
+// variable et TRES different d'un championnat/equipe a l'autre -- confirme
+// en direct : Premier League et Gamba Osaka (J1 League) ont du xG le jour
+// meme, mais Jeonbuk Hyundai Motors et Ulsan HD (K League 1, meme
+// championnat) ont un retard de plus d'un mois. Le garde-fou est donc
+// applique PAR EQUIPE (pas par championnat), et bloque purement et
+// simplement le xG de ce cote-la (b1/b2 ou b3/b4 = null, jamais une valeur
+// perimee affichee comme si elle etait fraiche) au-dela du seuil.
+const THESTATSAPI_FRESHNESS_DAYS = 21;
+
+// Corrige le 13/09/2026 -- certains championnats ont un nom sponsorise
+// chez TheStatsAPI totalement different du nom generique/historique
+// utilise dans l'app -- confirme en direct : "Primeira Liga" (Portugal)
+// n'existe chez eux que sous "Liga Portugal Betclic", aucun mot en
+// commun entre les deux, donc aucune tolerance de recherche (accents,
+// inclusion partielle) ne peut combler cet ecart. Alias direct,
+// necessaire au fil des championnats rencontres.
+const THESTATSAPI_LEAGUE_ALIASES = {
+  "primeira liga": "Liga Portugal Betclic",
+  // Ajoute le 13/09/2026 -- "Major League Soccer" n'existe chez eux que
+  // sous son sigle "MLS". Le filet de securite pays+type=league ne peut
+  // pas rattraper ce cas : les USA ont PLUSIEURS championnats de type
+  // "league" (MLS, NWSL, USL Championship, USL League One), donc le
+  // filet refuse a raison de deviner -- alias explicite necessaire.
+  "major league soccer": "MLS",
+  // Ajoute le 13/09/2026 -- "Jupiler Pro League" (nom sponsorise saisi
+  // dans l'app) n'existe chez eux que sous "Pro League" (sans sponsor).
+  // Meme cas que le Portugal -- et la Belgique a aussi 2 championnats de
+  // type league (Pro League + Challenger Pro League), le filet de
+  // securite pays+type=league ne peut donc pas deviner seul non plus.
+  "jupiler pro league": "Pro League",
+  // Ajoute le 13/09/2026 -- "La Liga" (avec espace, saisi dans l'app)
+  // vs "LaLiga" (sans espace, nom officiel chez eux) -- ecart minime
+  // mais suffisant pour faire echouer leur recherche. Espagne a aussi 2
+  // championnats de type league (LaLiga + LaLiga 2).
+  "la liga": "LaLiga",
+  // Ajoute le 13/09/2026 -- "Segunda División" (nom officiel API-Football,
+  // utilise dans le champ Championnat de l'app) n'existe chez TheStatsAPI
+  // que sous "LaLiga 2".
+  "segunda división": "LaLiga 2",
+};
+
+async function resolveTheStatsAPICompetition(env, leagueName, countryHint) {
+  const cacheKey = "tsa_comp:" + leagueName.toLowerCase().trim() + ":" + (countryHint || "").toLowerCase().trim();
+  const cached = await cacheGet(env, cacheKey);
+  if (cached) return cached;
+  const nomRecherche = THESTATSAPI_LEAGUE_ALIASES[leagueName.toLowerCase().trim()] || leagueName;
+  let res = await theStatsApiGet(env, "/football/competitions", { search: nomRecherche });
+  // Filet de securite generique le 13/09/2026 -- pour tout futur cas de
+  // renommage sponsorise non encore ajoute a THESTATSAPI_LEAGUE_ALIASES
+  // (ex. Primeira Liga -> Liga Portugal Betclic) : si la recherche par
+  // nom echoue mais qu'on connait le pays (countryHint), on retente en
+  // filtrant uniquement par pays + type=league. Utilise seulement si un
+  // SEUL championnat de type league existe pour ce pays -- plusieurs pays
+  // ont 1ere ET 2eme division toutes deux typees "league" (confirme :
+  // Portugal a "Liga Portugal Betclic" ET "Liga Portugal 2"), dans ce cas
+  // deviner serait pire que d'echouer proprement.
+  if ((!res || !res.length) && countryHint) {
+    const parPays = await theStatsApiGet(env, "/football/competitions", { country: countryHint, type: "league", per_page: 10 });
+    if (parPays && parPays.length === 1) res = parPays;
+  }
+  if (!res || !res.length) throw new Error("championnat introuvable chez TheStatsAPI: " + leagueName);
+  // Corrige le 12/09/2026 -- collision confirmee en direct : "Premier
+  // League" existe chez TheStatsAPI en Angleterre, Canada, Egypte,
+  // Israel, Russie et Ukraine -- leur recherche classait l'Angleterre
+  // seulement 4e, donc res[0] tombait sur le Canada (ou "Arsenal"
+  // n'existe evidemment pas). Meme mecanisme de departage par pays que
+  // pour resolveLeague (API-Football) et resolveSportKey (The Odds API).
+  let comp = res[0];
+  // Corrige le 13/09/2026 -- le departage par pays ne suffit pas quand
+  // l'ambiguite est DANS le meme pays : "Bundesliga" matchait "2.
+  // Bundesliga" (par inclusion partielle) ET "Bundesliga" (allemagne les
+  // deux) -- confirme en direct sur RB Leipzig. Le departage par pays
+  // choisissait arbitrairement le premier des deux (la 2e division,
+  // apparue en premier dans leurs resultats), jamais rattrape puisque
+  // les deux partagent le meme pays. Priorite absolue a une correspondance
+  // de nom EXACTE avant tout departage par pays.
+  const nomExact = res.find(c => (c.name || "").toLowerCase().trim() === nomRecherche.toLowerCase().trim());
+  if (nomExact) {
+    comp = nomExact;
+  } else if (countryHint) {
+    const ch = countryHint.toLowerCase().trim();
+    const match = res.find(c => (c.country || "").toLowerCase().trim() === ch);
+    if (match) comp = match;
+  }
+  await cacheSet(env, cacheKey, comp, 2592000); // 30 jours
+  return comp;
+}
+
+// Corrige le 13/09/2026 -- une table d'alias par club (comme celle qui
+// existait ici avant ce correctif) demande une correction manuelle a
+// chaque nouveau club rencontre avec caractere special. Solution
+// generale : au lieu de compter sur leur recherche (qui exige une
+// correspondance exacte caractere par caractere -- "Wisla" ne matche pas
+// "Wisła", le l-barre polonais n'est PAS un accent detachable, contrairement
+// a e/a/o accentues geres par stripDiacritics), on recupere la liste
+// COMPLETE des equipes du championnat une seule fois (mise en cache 30j,
+// quasi gratuit ensuite), et on compare nous-memes apres neutralisation
+// des accents ET des lettres speciales des deux cotes.
+const LETTRES_SPECIALES = {
+  "ł": "l", "Ł": "L", "ø": "o", "Ø": "O", "ß": "ss",
+  "þ": "th", "Þ": "Th", "đ": "d", "Đ": "D", "ı": "i",
+  // Ajoute le 13/09/2026 -- "æ" (scandinave) confirme en direct sur "FC
+  // Nordsjælland", saisi "Nordsjaelland" (epele) dans l'app.
+  "æ": "ae", "Æ": "AE",
+};
+function normaliseNomEquipe(s) {
+  let out = (s || "");
+  for (const [special, ascii] of Object.entries(LETTRES_SPECIALES)) out = out.split(special).join(ascii);
+  out = out.normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // accents detachables (é,á,ñ...)
+  return out.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// Ajoute le 13/09/2026 -- au-dela des accents/lettres speciales (deja
+// geres par normaliseNomEquipe), certains clubs ont une abreviation de
+// ville sans aucune sous-chaine commune avec le nom complet -- confirme
+// en direct : "LA Galaxy" (chez eux) vs "Los Angeles Galaxy" (saisi),
+// "losangelesgalaxy" ne contient litteralement pas "lagalaxy". Alias
+// ponctuel en dernier recours, apres l'echec de la comparaison generale.
+const THESTATSAPI_TEAM_ALIASES = {
+  "losangelesgalaxy": "LA Galaxy",
+  // Ajoute le 13/09/2026 -- "Hammarby FF" (saisi) vs "Hammarby IF" (nom
+  // officiel chez eux) -- suffixe suedois different (Idrottsforening vs
+  // Fotbollsforening), aucune sous-chaine commune sur ces 2 lettres.
+  "hammarbyff": "Hammarby IF",
+};
+
+async function resolveTheStatsAPITeam(env, competitionId, teamName) {
+  const cacheKey = "tsa_teamlist:" + competitionId;
+  let allTeams = await cacheGet(env, cacheKey);
+  if (!allTeams) {
+    const res = await theStatsApiGet(env, "/football/teams", { competition_id: competitionId, per_page: 100 });
+    allTeams = res || [];
+    await cacheSet(env, cacheKey, allTeams, 2592000); // 30 jours
+  }
+  const target = normaliseNomEquipe(teamName);
+  let team = allTeams.find(t => {
+    const n = normaliseNomEquipe(t.name);
+    return n === target || n.includes(target) || target.includes(n);
+  });
+  if (!team && THESTATSAPI_TEAM_ALIASES[target]) {
+    const alias = normaliseNomEquipe(THESTATSAPI_TEAM_ALIASES[target]);
+    team = allTeams.find(t => normaliseNomEquipe(t.name) === alias);
+  }
+  if (!team) throw new Error("équipe introuvable chez TheStatsAPI: " + teamName);
+  return team;
+}
+
+async function getRecentXGMatches(env, competitionId, teamId, isHomeSide) {
+  // Cache court (1h, comme getRecentFixtures cote API-Football) : la liste
+  // de matchs recents change a chaque journee jouee.
+  const cacheKey = "tsa_matches:" + competitionId + ":" + teamId + ":" + (isHomeSide ? "h" : "a");
+  const cached = await cacheGet(env, cacheKey);
+  if (cached) return cached;
+  const res = await theStatsApiGet(env, "/football/matches", { team_id: teamId, competition_id: competitionId, status: "finished", per_page: 50 });
+  const matches = (res || [])
+    .filter(m => m.xg_available && (isHomeSide ? m.home_team.id === teamId : m.away_team.id === teamId))
+    .sort((a, b) => new Date(b.utc_date) - new Date(a.utc_date))
+    .slice(0, 6);
+  await cacheSet(env, cacheKey, matches, 3600);
+  return matches;
+}
+
+async function getXGForSide(env, competitionId, teamId, isHomeSide) {
+  const matches = await getRecentXGMatches(env, competitionId, teamId, isHomeSide);
+  if (!matches.length) return { xgFor: null, xgAgainst: null, warning: "aucun match avec xG disponible" };
+  const mostRecentDate = new Date(matches[0].utc_date);
+  const daysSince = (Date.now() - mostRecentDate.getTime()) / 86400000;
+  const forVals = [], againstVals = [];
+  for (const m of matches) {
+    const statsCacheKey = "tsa_stats:" + m.id;
+    let stats = await cacheGet(env, statsCacheKey);
+    if (!stats) {
+      const res = await theStatsApiGet(env, "/football/matches/" + m.id + "/stats", null);
+      stats = res;
+      await cacheSet(env, statsCacheKey, stats, 2592000); // match termine, xG ne change jamais -- cache long
+    }
+    const xg = stats?.overview?.expected_goals?.all;
+    if (!xg) continue;
+    if (isHomeSide) { forVals.push(xg.home); againstVals.push(xg.away); }
+    else { forVals.push(xg.away); againstVals.push(xg.home); }
+  }
+  if (!forVals.length) return { xgFor: null, xgAgainst: null, warning: "stats xG indisponibles malgré xg_available=true", confiance: 1 };
+  const avg = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
+  // Corrige le 13/09/2026 -- sur demande explicite : le seuil de fraicheur
+  // (21j) ne bloque plus le xG, il l'accompagne d'un avertissement --
+  // meme philosophie que le badge "echantillon faible" existant ailleurs
+  // dans l'app (prevenir, jamais cacher une donnee reelle). Confirme en
+  // direct sur FC Utrecht (Eredivisie) : un seul match a l'exterieur
+  // disponible, vieux d'1 jour de plus que l'ancien seuil strict -- perdre
+  // cette donnee etait plus genant que de l'afficher avec prudence.
+  const warning = daysSince > THESTATSAPI_FRESHNESS_DAYS
+    ? "xG basé sur " + forVals.length + " match(s), dont le plus récent date de " + Math.round(daysSince) + " jours (seuil habituel " + THESTATSAPI_FRESHNESS_DAYS + "j) — fraîcheur limitée"
+    : null;
+  // Ajoute le 13/09/2026 -- sur demande explicite : le xG perime ne doit
+  // plus peser a 100% dans le calcul final comme une donnee fraiche.
+  // Confiance = 1.0 jusqu'au seuil (21j), puis decroit lineairement,
+  // plancher a 0.3 (jamais totalement ignore, juste moins pese) atteint a
+  // 51j. Formule choisie, pas mesuree par backtest -- a affiner si les
+  // resultats s'averent decevants une fois assez de matchs analyses avec.
+  const confiance = daysSince <= THESTATSAPI_FRESHNESS_DAYS
+    ? 1
+    : Math.max(0.3, 1 - (daysSince - THESTATSAPI_FRESHNESS_DAYS) / 30);
+  return { xgFor: avg(forVals), xgAgainst: avg(againstVals), warning, confiance };
+}
+
+// Ajoute le 13/09/2026 -- complement aux blessures API-Football (Round
+// 22, limitees aux grands championnats) : TheStatsAPI couvre 116+
+// championnats pour /injuries-suspensions, comble donc le meme trou que
+// pour le xG sur les championnats non couverts par API-Football. Meme
+// forme de sortie ({player, reason}) que l'existant -- reutilise tel
+// quel cote frontend, aucun changement necessaire la-bas.
+async function getPlayerName(env, playerId) {
+  const cacheKey = "tsa_player:" + playerId;
+  const cached = await cacheGet(env, cacheKey);
+  if (cached) return cached;
+  let name = playerId; // repli si l'appel echoue -- jamais bloquant
+  try {
+    const res = await theStatsApiGet(env, "/football/players/" + playerId, null);
+    if (res?.name) name = res.name;
+  } catch (err) {
+    // best-effort
+  }
+  await cacheSet(env, cacheKey, name, 2592000); // 30 jours, un nom de joueur ne change pas
+  return name;
+}
+
+async function getInjuriesForTeamTSA(env, teamId) {
+  const cacheKey = "tsa_injuries:" + teamId;
+  const cached = await cacheGet(env, cacheKey);
+  if (cached) return cached;
+  let list = [];
+  try {
+    const res = await theStatsApiGet(env, "/football/teams/" + teamId + "/injuries-suspensions", null);
+    const items = [
+      ...(res?.injuries || []).filter(i => i.active).map(i => ({ playerId: i.player_id, reason: (i.reason || "blessure").replace(/_/g, " ") })),
+      ...(res?.suspensions || []).filter(s => s.active).map(s => ({ playerId: s.player_id, reason: "suspension (" + (s.matches || 1) + " match" + ((s.matches || 1) > 1 ? "s" : "") + ")" })),
+    ];
+    for (const it of items) {
+      list.push({ player: await getPlayerName(env, it.playerId), reason: it.reason });
+    }
+  } catch (err) {
+    // best-effort -- jamais bloquant, juste une liste vide en cas d'echec
+  }
+  await cacheSet(env, cacheKey, list, 3600); // 1h, une blessure peut survenir a tout moment
+  return list;
+}
+
+async function getXGViaTheStatsAPI(env, leagueName, homeName, awayName, fsCountry) {
+  const warnings = [];
+  const comp = await resolveTheStatsAPICompetition(env, leagueName, fsCountry);
+  const homeTeam = await resolveTheStatsAPITeam(env, comp.id, homeName);
+  const awayTeam = await resolveTheStatsAPITeam(env, comp.id, awayName);
+  const homeSide = await getXGForSide(env, comp.id, homeTeam.id, true);
+  const awaySide = await getXGForSide(env, comp.id, awayTeam.id, false);
+  if (homeSide.warning) warnings.push("xG domicile (TheStatsAPI): " + homeSide.warning);
+  if (awaySide.warning) warnings.push("xG extérieur (TheStatsAPI): " + awaySide.warning);
+  // Confiance globale = la plus faible des deux cotes (domicile/exterieur)
+  // -- le maillon le plus faible determine la confiance globale du match,
+  // pas une moyenne qui masquerait un cote tres perime par un cote frais.
+  const confiance = Math.min(homeSide.confiance ?? 1, awaySide.confiance ?? 1);
+  // Reutilise homeTeam.id/awayTeam.id deja resolus juste au-dessus --
+  // aucun appel de resolution supplementaire, juste la recuperation des
+  // blessures/suspensions pour ces memes equipes.
+  let injuriesTSA = null;
+  try {
+    const [homeInj, awayInj] = await Promise.all([
+      getInjuriesForTeamTSA(env, homeTeam.id),
+      getInjuriesForTeamTSA(env, awayTeam.id),
+    ]);
+    if (homeInj.length || awayInj.length) injuriesTSA = { home: homeInj, away: awayInj };
+  } catch (err) {
+    // best-effort -- ne bloque jamais le xG si les blessures echouent
+  }
+  return {
+    b1: homeSide.xgFor, b2: homeSide.xgAgainst,
+    b3: awaySide.xgFor, b4: awaySide.xgAgainst,
+    confiance,
+    injuriesTSA,
+    warnings,
+  };
 }
 
 // Ajoute le 07/09/2026 -- certains noms de championnat existent a
+
 // l'identique dans plusieurs pays (ex. "Serie B" en Italie ET au Bresil,
 // confirme en direct sur Palermo vs Sampdoria : les deux obtenaient un
 // score parfaitement egal dans resolveLeague -- nom exact + type League +
@@ -801,7 +1150,20 @@ async function resolveLeague(env, leagueName, season, countryHint) {
   // nettoye peut faire remonter (ex. "Süper Lig" existe aussi en Serbie,
   // Moldavie, Slovaquie).
   const searchName = leagueName.split(/[—–-]/)[0].trim() || leagueName;
-  const res = await apiFootballGet(env, "/leagues", { search: searchName });
+  // Ajoute le 13/09/2026 -- paradoxe decouvert en direct sur "2. Bundesliga"
+  // (id API-Football 79) : leur nom officiel CONTIENT un point, mais leur
+  // champ de recherche REJETTE tout signe de ponctuation (meme erreur que
+  // le correctif du jour sur "1. FC Heidenheim") -- retirer le point pour
+  // passer la validation casse alors la correspondance avec leur propre
+  // nom stocke, qui lui garde le point. Impossible a resoudre par la
+  // recherche dans ce cas precis : alias direct par ID (fixe, ne change
+  // jamais) pour les rares championnats dans ce cas. Cle sans espace
+  // (norm() retire aussi les espaces, pas seulement la ponctuation).
+  const LEAGUE_ID_ALIASES = { "2bundesliga": 79 };
+  const idAlias = LEAGUE_ID_ALIASES[norm(searchName)];
+  const res = idAlias
+    ? await apiFootballGet(env, "/leagues", { id: idAlias })
+    : await apiFootballGet(env, "/leagues", { search: searchName });
   if (!res || !res.length) throw new Error("championnat introuvable: " + leagueName);
 
   // La recherche peut renvoyer plusieurs entrées proches (ex. "Liga MX"
@@ -1497,7 +1859,16 @@ async function resolveSportKey(env, leagueName, countryHint) {
     // titre officiel "K League 1" ne mentionne "Korea" nulle part dans
     // son propre texte -- confirme en direct sur Bucheon FC 1995 vs Jeju
     // United FC.
-    "kleague1": "soccer_korea_kleague1"
+    "kleague1": "soccer_korea_kleague1",
+    // Ajoute le 13/09/2026 -- "Jupiler Pro League" (nom sponsorise saisi
+    // dans l'app) n'existe chez The Odds API que sous "Belgium First Div"
+    // -- confirme en direct, aucun mot en commun entre les deux noms.
+    "jupilerproleague": "soccer_belgium_first_div",
+    // Ajoute le 13/09/2026 -- "2. Bundesliga" (saisi, chiffre au debut)
+    // vs "Bundesliga 2" (titre officiel chez The Odds API, chiffre a la
+    // fin) -- ordre des mots inverse, meme famille de collision que
+    // Turku PS/TPS Turku plus tot ce soir.
+    "2bundesliga": "soccer_germany_bundesliga2"
   };
   // Correctif du 07/09/2026 -- la premiere version de ce patch desactivait
   // l'alias des qu'un pays etait fourni, en partant du principe que le
