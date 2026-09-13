@@ -1646,7 +1646,7 @@ function renderValues(picks,E,sane){
     return '<div class="vrow'+(niveauCoherence(p)==='vert'?' coherVert':niveauCoherence(p)==='orange'?' coherOrange':'')+'">'+
       `<div class="vtop"><span class="vname">${p.label}${tag}${(function(){const n=niveauCoherence(p);return n==='vert'?'<span class="pastilleConf" title="Coherence forte : modele et book d accord a moins de 3 points, cote 1.50-1.75. ROI historique +4.9% sur 498 paris."></span>':n==='orange'?'<span class="pastilleOr" title="Coherence moyenne : accord a moins de 5 points, cote 1.45-1.85. ROI historique +1.7% sur 1423 paris."></span>':'';})()}</span><span class="vodd">cote ${fmt(p.o)}</span></div>`+
       `<div class="vmeta">modèle ${modeleTxt} · bookmaker ${implied}%${pinInline(p)}`+
-      (epureSport() && Math.abs(p.vA-p.vB)>=20 ? ` · <b style="color:var(--rose)">&#9888; xG : ${(p.pB*100).toFixed(0)}%</b>` : '')+
+      ''+  // ⚠ xG retire le 13/09 : en mode sport le badge rouge indique deja l'absence de xG, le pourcentage faisait doublon
       `</div>`+
       repereP(p)+
       (p.suspect?'<div class="hint" style="margin-top:2px">Value irréaliste sur un marché réel — probablement une cote isolée/périmée chez un bookmaker plutôt qu\'une vraie opportunité. Vérifie le consensus avant de parier dessus.</div>':'')+
@@ -1818,11 +1818,11 @@ function render(picks,sane){
     const divergSport = (analysisMode==='sport' && Math.abs(best.vA-best.vB)>=20)
       ? ' <b style="color:var(--rose)">\u26a0 seconde lecture divergente ('+Math.abs(best.vA-best.vB).toFixed(0)+' points)</b>' : '';
     const lo=(Math.min(best.pA,best.pB)*100).toFixed(0), hi=(Math.max(best.pA,best.pB)*100).toFixed(0);
-    const probaTxt = analysisMode==='sport'
+    const probaTxt = epureSport()
       ? (best.pA*100).toFixed(0)+' %'
       : (lo===hi ? lo+' %' : 'entre '+lo+' et '+hi+' %');
     v.innerHTML='<div class="lead">Verdict</div><div class="big">'+best.label+'</div>'+
-      `<div class="sub">Cote ${fmt(best.o)}, probabilité modèle ${probaTxt} — contre ${(100/best.o).toFixed(0)} % implicite du bookmaker.${divergSport}${lowSample?' <b style="color:var(--sky)">Échantillon faible</b> — moins de 8 matchs joués d\'un côté, le modèle s\'appuie surtout sur la moyenne du championnat plutôt que sur cette équipe.':''}${anySuspect?' <b style="color:var(--rose)">Un autre marché de ce match a été écarté</b> (cote isolée, value irréaliste) — sans lien avec ce pari.':''}</div>`+
+      `<div class="sub">Cote ${fmt(best.o)}, probabilité modèle ${probaTxt} — contre ${(100/best.o).toFixed(0)} % implicite du bookmaker.${divergSport}${lowSample?' <b style="color:var(--sky)">Échantillon faible</b> — moins de 8 matchs joués d\'un côté, le modèle s\'appuie surtout sur la moyenne du championnat plutôt que sur cette équipe.':''}</div>`+
       `<div class="stake">Mise fixe : ${cfg.stake.toFixed(2)} €${best.o<1.5?' · cote basse, marge élevée':''}</div>`+
       kellyLine;
   } else {

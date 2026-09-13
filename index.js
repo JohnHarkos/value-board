@@ -426,7 +426,17 @@ async function handleLookup(params, env) {
         }
       }
     })(),
-    fsCountry ? getLeagueAverages(leagueName, fsCountry, season) : Promise.resolve(null),
+    fsCountry ? (async () => {
+      try {
+        return await getLeagueAverages(leagueName, fsCountry, season);
+      } catch (fdErr) {
+        try {
+          return await getLeagueAveragesTSA(env, leagueName, fsCountry, season);
+        } catch (tsaErr) {
+          throw fdErr; // on remonte l'erreur football-data (message plus etabli)
+        }
+      }
+    })() : Promise.resolve(null),
   ]);
 
   let statsPart = null, xgPart = null, oddsPart = null;
@@ -532,7 +542,17 @@ async function handleMatch(params, env) {
       return await getXGViaTheStatsAPI(env, leagueName, homeName, awayName, fsCountry);
     })(),
     sportKey ? getOddsCached(env, sportKey, homeName, awayName) : Promise.reject(new Error("paramètre 'sport' non fourni")),
-    fsCountry ? getLeagueAverages(leagueName, fsCountry, season) : Promise.resolve(null),
+    fsCountry ? (async () => {
+      try {
+        return await getLeagueAverages(leagueName, fsCountry, season);
+      } catch (fdErr) {
+        try {
+          return await getLeagueAveragesTSA(env, leagueName, fsCountry, season);
+        } catch (tsaErr) {
+          throw fdErr; // on remonte l'erreur football-data (message plus etabli)
+        }
+      }
+    })() : Promise.resolve(null),
   ]);
 
   let statsPart = null, xgPart = null, oddsPart = null;
@@ -868,6 +888,10 @@ const THESTATSAPI_LEAGUE_ALIASES = {
   // utilise dans le champ Championnat de l'app) n'existe chez TheStatsAPI
   // que sous "LaLiga 2".
   "segunda división": "LaLiga 2",
+  // Ajoute le 13/09/2026 -- "Liga Profesional Argentina" (saisi) n'existe
+  // chez eux que sous "Liga Profesional de Fútbol" (sans le pays, "de
+  // Fútbol" au lieu de "Argentina").
+  "liga profesional argentina": "Liga Profesional de Fútbol",
 };
 
 async function resolveTheStatsAPICompetition(env, leagueName, countryHint) {
@@ -2282,7 +2306,23 @@ async function getOddsFromOddsPapiOnly(env, homeName, awayName) {
     out.bestBook[k] = best.book;
     out.spread[k] = { spread: max - min, count: arr.length };
   });
-  out.pinnacle = null;
+  // Repere Pinnacle no-vig calcule depuis les cotes OddsPapi (ajoute le
+  // 13/09/2026). Avant, out.pinnacle restait null sur les championnats
+  // 100% OddsPapi (ex. Danemark) : la cote Pinnacle apparaissait bien dans
+  // "Cotes du marche" mais le repere no-vig manquait dans "Paris coherents".
+  const pinPrice = (arr) => {
+    if (!arr || !arr.length) return null;
+    const p = arr.find(x => /pinnacle/i.test(x.book || ""));
+    return p ? p.price : null;
+  };
+  const noVig2 = (a, b) => { const ia=1/a, ib=1/b, t=ia+ib; return [ia/t, ib/t]; };
+  const noVig3 = (a, b, c) => { const ia=1/a, ib=1/b, ic=1/c, t=ia+ib+ic; return [ia/t, ib/t, ic/t]; };
+  const pinnacle = { p1: null, pX: null, p2: null, pO25: null, pU25: null };
+  const p1r = pinPrice(collect.o1), pXr = pinPrice(collect.oX), p2r = pinPrice(collect.o2);
+  if (p1r && pXr && p2r) { const [a,b,c] = noVig3(p1r, pXr, p2r); pinnacle.p1=a; pinnacle.pX=b; pinnacle.p2=c; }
+  const pOr = pinPrice(collect.oO25), pUr = pinPrice(collect.oU25);
+  if (pOr && pUr) { const [a,b] = noVig2(pOr, pUr); pinnacle.pO25=a; pinnacle.pU25=b; }
+  out.pinnacle = (pinnacle.p1!=null || pinnacle.pO25!=null) ? pinnacle : null;
   out.warning = "championnat non couvert par The Odds API -- toutes les cotes proviennent d'OddsPapi (aucune chez Betclic/Winamax/PMU) -- verifie le book avant de jouer";
   return out;
 }
@@ -2754,6 +2794,49 @@ async function fetchMainLeagueAveragesWithFallback(code, season) {
     result.seasonUsed = prevSeason;
     return result;
   }
+}
+
+// Ajoute le 13/09/2026 -- complement a football-data.co.uk (qui ne
+// reconnait qu'un nombre limite de pays/divisions) : TheStatsAPI couvre
+// 116+ championnats, meme principe que pour le xG et les blessures.
+// Reutilise resolveTheStatsAPICompetition deja construit pour le xG.
+// Calcule lgH/lgA en moyennant les buts DOMICILE et EXTERIEUR sur tous
+// les matchs termines de la saison en cours (pas d'agregat direct
+// domicile/exterieur expose par leur endpoint /standings).
+async function getLeagueAveragesTSA(env, leagueName, country, season) {
+  const cacheKey = "tsa_lgavg:" + norm(leagueName) + ":" + norm(country || "");
+  const cached = await cacheGet(env, cacheKey);
+  if (cached) return cached;
+
+  const comp = await resolveTheStatsAPICompetition(env, leagueName, country);
+  const detail = await theStatsApiGet(env, "/football/competitions/" + comp.id, null);
+  const seasonId = detail?.current_season_id;
+  if (!seasonId) throw new Error("aucune saison courante trouvée pour ce championnat chez TheStatsAPI");
+
+  let page = 1;
+  const homeGoals = [], awayGoals = [];
+  for (;;) {
+    const res = await theStatsApiGet(env, "/football/matches", {
+      competition_id: comp.id, season_id: seasonId, status: "finished", per_page: 100, page,
+    });
+    const matches = res || [];
+    for (const m of matches) {
+      if (m.score?.home != null && m.score?.away != null) {
+        homeGoals.push(m.score.home);
+        awayGoals.push(m.score.away);
+      }
+    }
+    if (matches.length < 100) break;
+    page++;
+    if (page > 10) break; // filet de securite, jamais attendu en pratique
+  }
+
+  if (!homeGoals.length) throw new Error("aucun match terminé trouvé chez TheStatsAPI pour la saison courante");
+
+  const avg = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
+  const result = { lgH: avg(homeGoals), lgA: avg(awayGoals), seasonUsed: null };
+  await cacheSet(env, cacheKey, result, 604800); // 7 jours, comme les autres agrégats de saison
+  return result;
 }
 
 async function getLeagueAverages(leagueName, country, season) {
