@@ -1719,6 +1719,7 @@ async function getUnderstatTeamWithFallback(slug, season, teamName, venueSide) {
   return { team: team || prevTeam, season, usedFallback: false };
 }
 
+
 async function getXGViaLeague(slug, season, homeName, awayName) {
   if (!slug) throw new Error("championnat non couvert par Understat");
 
