@@ -328,7 +328,7 @@ nav{background:rgba(12,18,24,.92) !important;backdrop-filter:blur(14px) !importa
   </section>
 
   <section id="valuesWrap" style="display:none">
-    <span class="eyebrow">Values de ce match<span id="sampleBadge" class="tag mix" style="display:none;margin-left:8px">échantillon faible</span></span>
+    <span class="eyebrow">Paris cohérents<span id="sampleBadge" class="tag mix" style="display:none;margin-left:8px">échantillon faible</span></span>
     <div id="valuesTable"></div>
     <p class="hint" id="valuesEmpty" style="display:none">Aucun marché ne dépasse le seuil dans les deux lectures à la fois — c'est un résultat normal, pas un échec.</p>
   </section>
@@ -1664,6 +1664,7 @@ function renderValues(picks,E,sane){
 // détails déjà présents dans "Values de ce match" plus bas.
 function renderProno(picks,E,sane){
   const wrap=$('pronoWrap'), box=$('pronoBox');
+  if(wrap){wrap.style.display='none';return;} // MON PRONO retire le 13/09 : doublon du verdict, le 'plus probable' n'est pas un conseil de pari
   if(!wrap||!box) return;
   // Corrigé le 14/08/2026 — le vrai problème n'était ni la cote ni la
   // value maximale : "Mon prono" choisissait le marché le plus probable
