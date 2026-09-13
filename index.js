@@ -2059,7 +2059,7 @@ const TEAM_SEARCH_ALIASES = {
 // en Europe -- PAS "ca" pour l'instant (trop ambigu avec les clubs
 // argentins "Club Atletico ..." -- a traiter separement si l'app s'etend
 // vers l'Amerique du Sud).
-const TEAM_NAME_STOPWORDS = new Set(["de", "del", "of", "the", "van", "der", "fc", "cf", "cd", "ac", "rc", "sc", "ud"]);
+const TEAM_NAME_STOPWORDS = new Set(["de", "del", "of", "the", "van", "der", "fc", "cf", "cd", "ac", "rc", "sc", "ud", "a", "la", "el", "los", "las", "sd", "cp"]);
 function teamNameTokensMatch(a, b) {
   const wordsA = (a || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
     .split(/[^a-z0-9]+/).filter(w => w && !TEAM_NAME_STOPWORDS.has(w));
